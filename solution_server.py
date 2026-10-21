@@ -38,9 +38,11 @@ CLIENTS: set[Any] = set()
 
 # Naive global set of disconnected student clients.
 # May need to refer to this for clients that reconnect later on.
+# TODO: Decide if this is necessary
 CLIENTS_DISCONNECTED: set[Any] = set()
 
-# Server stores the set of captions that have
+# Server stores the set of captions that are finalised +
+# the latest segment and revision
 SAVED_CAPTIONS: set[Any] = set()
 
 
@@ -124,11 +126,18 @@ async def handle_new_client(ws, hello: dict[str, Any]) -> None:
     CLIENTS for broadcasts, and removes it when the connection ends.
     """
     client_id = hello.get("client_id")
+    history_seconds = hello.get("history_seconds")
+    current_time = time.time()
+
+    # Send all captions within the last `history_seconds`
+    latest_captions = [
+        c for c in SAVED_CAPTIONS if (current_time - c.get('source_ts') < history_seconds)
+    ]
 
     # The baseline has no stored recovery state. Sending an empty HISTORY makes
     # the connection behavior visible and keeps the starter easy to inspect.
     # Students must implement correct HISTORY semantics for the assignment.
-    await ws.send(json.dumps({"type": "HISTORY", "items": []}))
+    await ws.send(json.dumps({"type": "HISTORY", "items": latest_captions}))
 
     CLIENTS.add(ws)
     print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
@@ -138,6 +147,7 @@ async def handle_new_client(ws, hello: dict[str, Any]) -> None:
         async for _ in ws:
             pass
     finally:
+        # When they disconnect, remove from list.
         CLIENTS.discard(ws)
         print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
 
@@ -149,24 +159,48 @@ async def handle_reconnected_client(ws, hello: dict[str, Any]) -> None:
     Previously connected clients give a CLIENT_HELLO(last_segment=X, last_revision=X, history_seconds=30)
     Server should pick up on this and give the most recent captions in the past `history_seconds`
     """
-    # TODO: Filter through the server's saved captions and 
-    # give only the latest updates in the last history_seconds
+    client_id = hello.get("client_id")
     current_time = time.time()
     last_segment = hello.get("last_segment")
     last_revision = hello.get("last_revision")
     history_seconds = hello.get('history_seconds')
+
+    """
+    Filter through the list of captions stored in server 
+    and only send those that are most updated and missed by the client
+    when they were disconnected.
+    """
     latest_captions = [
         c for c in SAVED_CAPTIONS if 
+        # caption was within the last history_seconds and
         (current_time - c.get('source_ts') < history_seconds) and
+            # this is a new segment that client does not have or
             ((c.get('segment') > last_segment) or 
+             # it is an update to the revision the client had
              (c.get('segment') == last_segment and c.get('revision') > last_revision))
     ]
 
-    await ws.send(json.dumps({"type": "HISTORY", "items": [latest_captions]}))
+    await ws.send(json.dumps({"type": "HISTORY", "items": latest_captions}))
+
+    # Add to list of connected clients
+    CLIENTS.add(ws)
+    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+    try:
+        # Student clients normally don't send further messages after hello.
+        # Keep the WebSocket open until the client disconnects.
+        async for _ in ws:
+            pass
+    finally:
+        # When they disconnect, remove from list
+        CLIENTS.discard(ws)
+        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+
+
 
 
 async def handler(ws) -> None:
-    """Read and validate the first WebSocket message, then route by hello type.
+    """
+    Read and validate the first WebSocket message, then route by hello type.
 
     Connections that do not send valid JSON within five seconds, or send an
     unsupported hello type, are closed with policy-violation status.
