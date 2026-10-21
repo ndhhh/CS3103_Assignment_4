@@ -43,7 +43,7 @@ CLIENTS_DISCONNECTED: set[Any] = set()
 
 # Server stores the set of captions that are finalised +
 # the latest segment and revision
-SAVED_CAPTIONS: set[Any] = set()
+SAVED_CAPTIONS: list[Any] = []
 
 
 async def broadcast_naively(raw_message: str) -> None:
@@ -68,7 +68,8 @@ async def broadcast_naively(raw_message: str) -> None:
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
-    """Read messages from a caption source and relay caption updates to clients.
+    """
+    Read messages from a caption source and relay caption updates to clients.
 
     Invalid JSON and unsupported message types are ignored. SOURCE_DONE is
     logged but not forwarded, and the source is logged as disconnected on exit.
@@ -77,6 +78,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
     print(f"source connected: session={session}", flush=True)
 
     try:
+        # Keepo listening to source caption updates
         async for raw in ws:
             try:
                 msg = json.loads(raw)
@@ -85,9 +87,48 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
 
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
+                session = msg.get("session")
+                segment = msg.get("segment")
+                revision = msg.get("revision")
+                source_ts = msg.get("source_ts")
+                final = msg.get("final")
+
+                """
+                Add message to server's history (to send to new/reconnecting clients)
+                Under overload, the server may suppress obsolete provisional revisions. 
+                However, it must preserve the final caption for every completed segment 
+                and the latest available revision of any currently active segment.
+                """
+                # Add type checks first
+                # if type(segment) is not int or type(revision) is not int:
+                #     continue
+                existing_caption = next(
+                    (
+                        c for c in SAVED_CAPTIONS
+                        if c.get("segment") == segment
+                        and c.get("session") == session
+                    ),
+                    None
+                )
+
+                if existing_caption is None:
+                    # If caption does not exist, add to list
+                    SAVED_CAPTIONS.append(msg)
+                elif existing_caption.get("final"):
+                    # If existing caption is final, don't edit
+                    continue
+                elif revision > existing_caption.get("revision", 0):
+                    # Remove and add new updated caption
+                    existing_caption["revision"] = revision
+                    existing_caption["text"] = msg.get("text")
+                    existing_caption["source_ts"] = source_ts
+                    existing_caption["final"] = final
+
                 # Baseline behavior: forward exactly what was received.
                 # No history, state, validation, coalescing, or bounded queues.
+                # TODO: Update this
                 await broadcast_naively(raw)
+                
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
@@ -129,15 +170,18 @@ async def handle_new_client(ws, hello: dict[str, Any]) -> None:
     history_seconds = hello.get("history_seconds")
     current_time = time.time()
 
-    # Send all captions within the last `history_seconds`
+    # Send all captions within the last `history_seconds` that are final
     latest_captions = [
-        c for c in SAVED_CAPTIONS if (current_time - c.get('source_ts') < history_seconds)
+        c for c in SAVED_CAPTIONS if 
+        current_time - c.get('source_ts') < history_seconds and
+        c.get("final")
     ]
 
+    sorted_captions = sorted(latest_captions, key=lambda x: x.get("source_ts"))
     # The baseline has no stored recovery state. Sending an empty HISTORY makes
     # the connection behavior visible and keeps the starter easy to inspect.
     # Students must implement correct HISTORY semantics for the assignment.
-    await ws.send(json.dumps({"type": "HISTORY", "items": latest_captions}))
+    await ws.send(json.dumps({"type": "HISTORY", "items": sorted_captions}))
 
     CLIENTS.add(ws)
     print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
@@ -179,8 +223,8 @@ async def handle_reconnected_client(ws, hello: dict[str, Any]) -> None:
              # it is an update to the revision the client had
              (c.get('segment') == last_segment and c.get('revision') > last_revision))
     ]
-
-    await ws.send(json.dumps({"type": "HISTORY", "items": latest_captions}))
+    sorted_captions = sorted(latest_captions, key=lambda x: x.get("source_ts"))
+    await ws.send(json.dumps({"type": "HISTORY", "items": sorted_captions}))
 
     # Add to list of connected clients
     CLIENTS.add(ws)
@@ -196,11 +240,9 @@ async def handle_reconnected_client(ws, hello: dict[str, Any]) -> None:
         print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
 
 
-
-
 async def handler(ws) -> None:
     """
-    Read and validate the first WebSocket message, then route by hello type.
+    Read and validate the FIRST WebSocket message, then route by hello type.
 
     Connections that do not send valid JSON within five seconds, or send an
     unsupported hello type, are closed with policy-violation status.
