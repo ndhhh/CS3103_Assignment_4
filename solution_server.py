@@ -31,34 +31,6 @@ from typing import Any
 
 import websockets
 
-"""
-Cmd Line for setting up multipass + mounting files to be run
-
-```bash
-multipass launch --name liverecall --cpus 2 --memory 4G --disk 15G
-multipass shell liverecall
-mkdir Assignment4
-exit
-multipass set local.privileged-mounts=true
-multipass mount <Absolute path to assignment files> liverecall:/home/ubuntu/Assignment4
-multipass shell liverecall
-```
-
-Inside Ubuntu:
-
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip iproute2
-python3 -m venv ~/liverecall-venv
-source ~/liverecall-venv/bin/activate
-pip install -r requirements.txt
-```
-
-When finished, exit the VM shell and run on the host:
-
-```bash
-multipass stop liverecall
-"""
 
 # Naive global set of currently connected student clients.
 # There is deliberately no per-client queue or recovery state here.
