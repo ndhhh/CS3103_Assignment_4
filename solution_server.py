@@ -114,7 +114,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                 if existing_caption is None:
                     # If caption does not exist, add to list
                     SAVED_CAPTIONS.append(msg)
-                elif existing_caption.get("final"):
+                elif existing_caption.get("final") is True:
                     # If existing caption is final, don't edit
                     continue
                 elif revision > existing_caption.get("revision", 0):
