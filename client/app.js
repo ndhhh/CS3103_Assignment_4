@@ -100,7 +100,7 @@ function connect() {
       // then perform the appending/displaying logic
       const existing = CAPTIONS_STATE.get(msg.segment);
       
-      if (!existing || (msg.revision > existing.revision && msg.final !== true)) {
+      if (!existing || (msg.revision > existing.revision && existing.final !== true)) {
         // Update state with latest revision OR add if this is a new caption
         CAPTIONS_STATE.set(msg.segment, msg);
 
@@ -183,14 +183,17 @@ for (const button of document.querySelectorAll("button[data-seconds]")) {
   button.addEventListener("click", () => {
     const seconds = Number(button.dataset.seconds);
     // Update the recent finalised captions in the Recall div element
-    const currentTime = new Date() / 1000;
+    const currentTime = Date.now() / 1000;
     const recentFinals = [...CAPTIONS_STATE.values()]
       .filter((caption) => caption.final)     // Only display finalised captions
       .sort((a, b) => a.segment - b.segment)
       .filter((caption) => currentTime - caption.source_ts < seconds) // Only display those within `seconds` of currentTime
+
     recallEl.textContent = recentFinals
-      .map((caption) => caption.text)
+      .map((caption) => `[${Number(caption.segment)}] ${caption.text}`)
       .join("\n");
+
+    recallEl.scrollTop = recallEl.scrollHeight;
     // Obsolete placeholder:
     // recallEl.textContent = `TODO: show finalized captions from the previous ${seconds} seconds using local state.`;
   });
