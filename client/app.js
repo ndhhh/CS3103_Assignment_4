@@ -218,11 +218,19 @@ disconnectButton.addEventListener("click", () => {
 });
 
 resetButton.addEventListener("click", () => {
-    CAPTIONS_STATE.clear;
-    lastSegment = 0;
-    lastRevision = 0;
-    console.log("Client has been reset; state is cleared.");
-})
+  CAPTIONS_STATE.clear();
+  liveEl.replaceChildren();
+  lastSegment = 0;
+  lastRevision = 0;
+  renderRecall();
+
+  if (ws?.readyState === WebSocket.OPEN) {
+    statusEl.textContent = "resetting";
+    ws.close(1000, "Client state reset");
+  }
+
+  console.log("Client state cleared; reconnecting for recent history.");
+});
 
 // Expire old finalized rows even when no new captions are arriving.
 setInterval(() => {
