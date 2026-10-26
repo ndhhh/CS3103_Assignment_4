@@ -8,6 +8,7 @@
 const WS_URL = "ws://127.0.0.1:8765";
 const SESSION_ID = "L1";
 const FINAL_RETENTION_SECONDS = 90;
+const MIN_DISPLAY_SECONDS = 5;
 const SERVER_HISTORY_SECONDS = 60;
 
 const statusEl = document.getElementById("status");
@@ -15,6 +16,8 @@ const liveEl = document.getElementById("live");
 const recallEl = document.getElementById("recall");
 const disconnectButton = document.getElementById("disconnect");
 const resetButton = document.getElementById("reset");
+const slowButton = document.getElementById("slow");
+const slowStatusEl = document.getElementById("slow-status");
 
 // Each value stores the latest caption fields plus the row used to display it.
 const CAPTIONS_STATE = new Map();
@@ -25,8 +28,19 @@ let recallWindowSeconds = 30;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
 let ws;
+let slowMode = new URLSearchParams(location.search).get("slow") === "1";
 
 disconnectButton.disabled = true;
+slowButton.disabled = true;
+
+function setSlowMode(enabled) {
+  slowMode = enabled;
+  slowButton.textContent = enabled ? "Resume normal speed" : "Simulate slow client";
+  slowStatusEl.textContent = enabled ? "Slow simulation: one message every 2 seconds." : "";
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "CLIENT_SETTINGS", slow: enabled }));
+  }
+}
 
 function numericClientId() {
   const key = "liverecall-client-id";
@@ -54,9 +68,10 @@ function createCaptionRow(segment) {
 
 function renderCaption(caption) {
   const label = caption.final ? "FINAL" : "PROVISIONAL";
+  const delayed = Date.now() / 1000 - caption.source_ts > FINAL_RETENTION_SECONDS;
   caption.row.className = `caption-line ${caption.final ? "final" : "provisional"}`;
   caption.row.textContent =
-    `[${label}] segment ${caption.segment} rev ${caption.revision}: ${caption.text}`;
+    `[${label}${delayed ? ", delayed" : ""}] segment ${caption.segment} rev ${caption.revision}: ${caption.text}`;
   liveEl.scrollTop = liveEl.scrollHeight;
 }
 
@@ -86,6 +101,7 @@ function upsertCaption(msg) {
 
   const caption = {
     ...msg,
+    receivedAt: Date.now() / 1000,
     row: existing?.row ?? createCaptionRow(msg.segment),
   };
   CAPTIONS_STATE.set(msg.segment, caption);
@@ -107,7 +123,8 @@ function upsertCaption(msg) {
 function pruneExpiredFinals(nowSeconds = Date.now() / 1000) {
   const cutoff = nowSeconds - FINAL_RETENTION_SECONDS;
   for (const [segment, caption] of CAPTIONS_STATE) {
-    if (caption.final && caption.source_ts < cutoff) {
+    if (caption.final && caption.source_ts < cutoff &&
+        nowSeconds - caption.receivedAt >= MIN_DISPLAY_SECONDS) {
       caption.row.remove();
       CAPTIONS_STATE.delete(segment);
     }
@@ -169,6 +186,7 @@ function connect() {
     statusEl.textContent = "connected";
     console.log("Client connected.")
     disconnectButton.disabled = false;
+    slowButton.disabled = false;
     reconnectAttempt = 0;
     ws.send(JSON.stringify({
       type: "CLIENT_HELLO",
@@ -178,6 +196,7 @@ function connect() {
       last_revision: lastRevision,
       history_seconds: SERVER_HISTORY_SECONDS,
     }));
+    setSlowMode(slowMode);
   });
 
   ws.addEventListener("message", handleServerMessage);
@@ -185,6 +204,7 @@ function connect() {
   ws.addEventListener("close", () => {
     statusEl.textContent = "disconnected";
     disconnectButton.disabled = true;
+    slowButton.disabled = true;
     if (reconnectTimer !== null) return;
 
     const delay = Math.min(3000 * 2 ** reconnectAttempt, 30000);
@@ -217,6 +237,8 @@ disconnectButton.addEventListener("click", () => {
   }
 });
 
+slowButton.addEventListener("click", () => setSlowMode(!slowMode));
+
 resetButton.addEventListener("click", () => {
   CAPTIONS_STATE.clear();
   liveEl.replaceChildren();
@@ -232,11 +254,12 @@ resetButton.addEventListener("click", () => {
   console.log("Client state cleared; reconnecting for recent history.");
 });
 
-// Expire old finalized rows even when no new captions are arriving.
+// Let delayed arrivals remain readable before expiring their rows.
 setInterval(() => {
   pruneExpiredFinals();
   renderRecall();
 }, 1000);
 
+setSlowMode(slowMode);
 renderRecall();
 connect();

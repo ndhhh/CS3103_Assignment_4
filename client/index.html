@@ -22,6 +22,8 @@
     <p style="display:inline-block;">Connection: <span id="status">disconnected</span></p>
     <button id="disconnect" type="button">Simulate disconnect</button>
     <button id="reset" type="button">Reset client</button>
+    <button id="slow" type="button">Simulate slow client</button>
+    <span id="slow-status"></span>
   </div>
 
   <p class="hint">Each segment keeps one row. Provisional revisions update it until the final caption arrives.</p>
@@ -32,6 +34,6 @@
     <button data-seconds="60">60 s</button>
   </div>
   <div id="recall">No finalized captions in the last 30 seconds.</div>
-  <script src="app.js?v=ui-update"></script>
+  <script src="app.js?v=delayed-captions"></script>
 </body>
 </html>

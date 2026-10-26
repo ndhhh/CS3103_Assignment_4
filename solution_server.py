@@ -1,25 +1,5 @@
 #!/usr/bin/env python3
-"""
-CS3103 Assignment 4 - LiveRecall naive working baseline.
-
-This starter is intentionally useful but incomplete. It provides the required
-CLI and a basic WebSocket broadcaster so that caption_source.py -> server ->
-browser/load clients works on day one.
-
-It DOES NOT implement the graded networking mechanisms:
-  - revision-state management or deduplication
-  - recent-history recovery or late-join recovery
-  - bounded per-client application queues
-  - slow-client isolation
-  - semantic coalescing / backpressure
-  - constrained-bandwidth overload handling
-
-Required evaluator command:
-    python solution_server.py --port 8765
-
-Teams should replace or substantially extend the implementation while keeping
-this command-line interface and the protocol in the assignment specification.
-"""
+"""LiveRecall WebSocket server. Run with: python solution_server.py --port 8765."""
 
 from __future__ import annotations
 
@@ -29,25 +9,36 @@ import json
 import math
 import time
 from contextlib import suppress
+from dataclasses import dataclass, field
 from typing import Any
 
 import websockets
+from websockets.exceptions import ConnectionClosed
+
+from client_outbox import ClientOutbox, encode_message
 
 
-# Naive global set of currently connected student clients.
-# There is deliberately no per-client queue or recovery state here.
-CLIENTS: set[Any] = set()
+@dataclass
+class ClientState:
+    ws: Any
+    session: str = "L1"
+    cursor: tuple[int, int] = (0, 0)
+    last_update: tuple[int, int] = (0, 0)
+    history_since: float = 0
+    recovering: bool = False
+    needs_history: bool = True
+    slow_mode: bool = False
+    outbox: ClientOutbox = field(default_factory=ClientOutbox)
+    sender: asyncio.Task | None = None
+    closing: asyncio.Task | None = None
 
-# Naive global set of disconnected student clients.
-# May need to refer to this for clients that reconnect later on.
-# TODO: Decide if this is necessary
-CLIENTS_DISCONNECTED: set[Any] = set()
 
-# Server stores the set of captions that are finalised +
-# the latest segment and revision
+CLIENTS: dict[Any, ClientState] = {}
 SAVED_CAPTIONS: list[Any] = []
 
 MAX_HISTORY = 90
+MAX_MESSAGE_BYTES = 2**20
+HISTORY_CHUNK_BYTES = 256 * 1024
 
 
 def validate_caption_update(msg: Any) -> bool:
@@ -106,81 +97,74 @@ def upsert_caption(msg: dict[str, Any]) -> dict[str, Any] | None:
     return accepted_caption
 
 
-async def broadcast_naively(raw_message: str) -> None:
-    """Send one message directly to every connected client.
+def close_client(client, reason="Connection closed"):
+    if client.closing is None:
+        CLIENTS.pop(client.ws, None)
+        client.outbox.close()
+        client.closing = asyncio.create_task(client.ws.close(code=1000, reason=reason))
+    return client.closing
 
-    This is intentionally a naive baseline. The source handler waits for all
-    sends to complete. Under pressure, this design may accumulate delay and is
-    not the target architecture for the assignment.
-    """
-    # If no clients currently, then dont send anything
-    if not CLIENTS:
-        return
 
-    snapshot = list(CLIENTS)
-    results = await asyncio.gather(
-        *(client.send(raw_message) for client in snapshot),
-        return_exceptions=True,
-    )
-    for client, result in zip(snapshot, results):
-        if isinstance(result, Exception):
-            CLIENTS.discard(client)
+async def publish_update(update):
+    message = encode_message(update)
+    clients = tuple(client for client in CLIENTS.values() if not client.recovering)
+    for index, client in enumerate(clients, 1):
+        if not client.outbox.offer(message):
+            client.recovering = True
+            client.history_since = time.time() - MAX_HISTORY
+        if index % 256 == 0:
+            await asyncio.sleep(0)
+
+
+async def send_client_messages(client):
+    sent = 0
+    try:
+        while True:
+            if client.recovering and client.outbox.count == 0:
+                client.recovering = not queue_recovery(client)
+            message = await client.outbox.get()
+            if message is None:
+                break
+            try:
+                if client.slow_mode:
+                    await asyncio.sleep(2)
+                await client.ws.send(message.text)
+                if message.position is not None:
+                    client.last_update = max(client.last_update, message.position)
+                    if message.final or message.key is None:
+                        client.cursor = max(client.cursor, message.position)
+            finally:
+                client.outbox.complete(message)
+            sent += 1
+            if sent % 16 == 0:
+                await asyncio.sleep(0)
+    except ConnectionClosed:
+        pass
+    finally:
+        close_client(client)
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
-    """
-    Read messages from a caption source and relay caption updates to clients.
-
-    Invalid JSON and unsupported message types are ignored. SOURCE_DONE is
-    logged but not forwarded, and the source is logged as disconnected on exit.
-    """
-    session = hello.get("session")
-    print(f"source connected: session={session}", flush=True)
-
-    try:
-        # Keepo listening to source caption updates
-        async for raw in ws:
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(msg, dict):
-                continue
-
-            msg_type = msg.get("type")
-            if msg_type == "CAPTION_UPDATE":
-                if not validate_caption_update(msg):
-                    continue
-
-                accepted_caption = upsert_caption(msg)
-                if accepted_caption is None:
-                    continue
-
-                await broadcast_naively(json.dumps(accepted_caption))
-                
-            elif msg_type == "SOURCE_DONE":
-                # Test-control message. The specification does not require it
-                # to be forwarded to clients.
-                print("source finished", flush=True)
-            else:
-                # Forward compatibility: ignore fields/messages this baseline
-                # doesn't understand rather than crashing.
-                continue
-    finally:
-        print("source disconnected", flush=True)
+    async for raw in ws:
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(msg, dict) or msg.get("type") != "CAPTION_UPDATE":
+            continue
+        if not validate_caption_update(msg) or msg["session"] != hello.get("session"):
+            continue
+        accepted_caption = upsert_caption(msg)
+        if accepted_caption is not None:
+            await publish_update(accepted_caption)
 
 
 async def prune_history(max_history: int = MAX_HISTORY):
-    """
-    Prunes captions in SAVED_CAPTIONS that are older than `max_history`.
-    
-    This is to minimise space and satisfy client recovery. 
-    It cannot keep an unbounded lecture transcript.
-    """
+    """Remove captions outside the server's retention window."""
     current_time = time.time()
-    # Take only captions that existed in the last `max_history` seconds
-    pruned_captions = [c for c in SAVED_CAPTIONS if 0 <= current_time - c.get("source_ts") <= max_history]
-    SAVED_CAPTIONS[:] = pruned_captions # Overwrite
+    SAVED_CAPTIONS[:] = [
+        c for c in SAVED_CAPTIONS if 0 <= current_time - c["source_ts"] <= max_history
+    ]
 
 
 async def prune_history_periodically() -> None:
@@ -190,117 +174,118 @@ async def prune_history_periodically() -> None:
         await asyncio.sleep(1)
 
 
-async def handle_client(ws, hello: dict[str, Any]) -> None:
-    """
-    Initialise a student client connection and keep it open until disconnect.
-
-    Server checks if client is a new connection with CLIENT_HELLO(last_segment=0, last_revision=0, history_seconds=30)
-    or a reconnected client with CLIENT_HELLO(last_segment=X, last_revision=X, history_seconds=30)
-    """
-    last_segment = hello.get("last_segment")
-    last_revision = hello.get("last_revision")
-    if last_segment == 0 and last_revision == 0:
-        # If both fields are zero, this is a new client
-        await handle_new_client(ws, hello)
-    else:
-        # If non-zero, this is a reconnected client
-        await handle_reconnected_client(ws, hello)
+def validate_client_hello(hello):
+    segment = hello.get("last_segment")
+    revision = hello.get("last_revision")
+    seconds = hello.get("history_seconds")
+    session = hello.get("session")
+    return (
+        isinstance(session, str) and bool(session.strip())
+        and type(segment) is int and segment >= 0
+        and type(revision) is int and revision >= 0
+        and (segment == 0) == (revision == 0)
+        and type(seconds) in (int, float) and 0 <= seconds <= 60
+    )
 
 
-async def handle_new_client(ws, hello: dict[str, Any]) -> None:
-    """
-    Initialize a student client connection and keep it open until disconnect.
-
-    The baseline sends an empty HISTORY response, tracks the connection in
-    CLIENTS for broadcasts, and removes it when the connection ends.
-    """
-    client_id = hello.get("client_id")
-    history_seconds = hello.get("history_seconds")
-    current_time = time.time()
-
-    # Send all captions within the last `history_seconds` that are final + latest provisionary caption
-    latest_captions = [
-        c for c in SAVED_CAPTIONS if 
-        (0 <= current_time - c.get('source_ts') < history_seconds and
-        c.get("final") or SAVED_CAPTIONS.index(c) == len(SAVED_CAPTIONS) - 1)
-    ]
-
-    sorted_captions = sorted(latest_captions, key=lambda x: x.get("source_ts"))
-    # The baseline has no stored recovery state. Sending an empty HISTORY makes
-    # the connection behavior visible and keeps the starter easy to inspect.
-    # Students must implement correct HISTORY semantics for the assignment.
-    await ws.send(json.dumps({"type": "HISTORY", "items": sorted_captions}))
-    await add_client(ws, client_id)
+def queue_history(client, items):
+    if not client.outbox.offer(encode_message({"type": "HISTORY", "items": items})):
+        return False
+    client.needs_history = False
+    return True
 
 
-async def handle_reconnected_client(ws, hello: dict[str, Any]) -> None:
-    """
-    Accepts a connection from a previously connected client.
+def queue_recovery(client):
+    now = time.time()
+    cursor = client.cursor
+    captions = sorted(
+        (c for c in SAVED_CAPTIONS if c["session"] == client.session),
+        key=lambda c: c["source_ts"],
+    )
+    items = []
+    size = 32
+    for caption in captions:
+        if (not caption["final"] or caption["source_ts"] < client.history_since
+                or not 0 <= now - caption["source_ts"] <= MAX_HISTORY):
+            continue
+        if (caption["segment"], caption["revision"]) <= cursor:
+            continue
+        message = encode_message(caption)
+        item_size = message.size + 1
+        if item_size + 32 > MAX_MESSAGE_BYTES:
+            if (items or client.needs_history) and not queue_history(client, items):
+                return False
+            items = []
+            size = 32
+            if not client.outbox.offer(message):
+                return False
+            continue
+        if items and size + item_size > HISTORY_CHUNK_BYTES:
+            if not queue_history(client, items):
+                return False
+            items = []
+            size = 32
+        items.append(caption)
+        size += item_size
 
-    Previously connected clients give a CLIENT_HELLO(last_segment=X, last_revision=X, history_seconds=30)
-    Server should pick up on this and give the most recent captions in the past `history_seconds`
-    """
-    client_id = hello.get("client_id")
-    current_time = time.time()
-    last_segment = hello.get("last_segment")
-    last_revision = hello.get("last_revision")
-    history_seconds = hello.get('history_seconds')
+    if items or client.needs_history:
+        if not queue_history(client, items):
+            return False
 
-    """
-    Filter through the list of captions stored in server 
-    and only send those that are most updated and missed by the client
-    when they were disconnected.
-    """
-    latest_captions = [
-        c for c in SAVED_CAPTIONS if 
-        # caption was within the last history_seconds and
-        (0 <= current_time - c.get('source_ts') < history_seconds) and
-            # this is a new segment that client does not have or
-            ((c.get('segment') > last_segment) or 
-             # it is an update to the revision the client had
-             (c.get('segment') == last_segment and c.get('revision') > last_revision))
-    ]
-    sorted_captions = sorted(latest_captions, key=lambda x: x.get("source_ts"))
-    await ws.send(json.dumps({"type": "HISTORY", "items": sorted_captions}))
-    await add_client(ws, client_id)
+    for caption in captions:
+        if (not caption["final"] and (caption["segment"], caption["revision"]) > client.last_update
+                and 0 <= now - caption["source_ts"] <= MAX_HISTORY):
+            if not client.outbox.offer(encode_message(caption)):
+                return False
+    return True
 
 
-async def add_client(ws, client_id):
-    # Add to list of connected clients
-    CLIENTS.add(ws)
-    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+async def handle_client(ws, hello):
+    if not validate_client_hello(hello):
+        await ws.close(code=1008, reason="Invalid client hello")
+        return
+
+    cursor = (hello["last_segment"], hello["last_revision"])
+    client = ClientState(ws, session=hello["session"], cursor=cursor, last_update=cursor,
+                         history_since=time.time() - hello["history_seconds"])
+    client.recovering = not queue_recovery(client)
+    # No await between taking the history snapshot and subscribing to live updates.
+    CLIENTS[ws] = client
+    client.sender = asyncio.create_task(send_client_messages(client))
     try:
-        # Student clients normally don't send further messages after hello.
-        # Keep the WebSocket open until the client disconnects.
-        async for _ in ws:
-            pass
+        async for raw in ws:
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if (isinstance(message, dict) and message.get("type") == "CLIENT_SETTINGS"
+                    and type(message.get("slow")) is bool):
+                client.slow_mode = message["slow"]
     finally:
-        # When they disconnect, remove from list.
-        CLIENTS.discard(ws)
-        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+        await close_client(client)
+        client.sender.cancel()
+        with suppress(asyncio.CancelledError):
+            await client.sender
 
 
 async def handler(ws) -> None:
-    """
-    Read and validate the FIRST WebSocket message, then route by hello type.
-
-    Connections that do not send valid JSON within five seconds, or send an
-    unsupported hello type, are closed with policy-violation status.
-    """
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=5)
         hello = json.loads(raw)
+        if not isinstance(hello, dict):
+            await ws.close(code=1008, reason="Expected a hello object")
+            return
+
+        if hello.get("type") == "SOURCE_HELLO":
+            await handle_source(ws, hello)
+        elif hello.get("type") == "CLIENT_HELLO":
+            await handle_client(ws, hello)
+        else:
+            await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
     except (asyncio.TimeoutError, json.JSONDecodeError):
         await ws.close(code=1008, reason="Expected a valid hello message")
-        return
-
-    msg_type = hello.get("type")
-    if msg_type == "SOURCE_HELLO":
-        await handle_source(ws, hello)
-    elif msg_type == "CLIENT_HELLO":
-        await handle_client(ws, hello)
-    else:
-        await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
+    except ConnectionClosed:
+        pass
 
 
 async def main_async(port: int) -> None:
@@ -309,15 +294,19 @@ async def main_async(port: int) -> None:
         handler,
         "0.0.0.0",
         port,
-        max_size=2**20,
+        max_size=MAX_MESSAGE_BYTES,
+        write_limit=32 * 1024,
+        close_timeout=1,
         ping_interval=20,
-        ping_timeout=20,
+        ping_timeout=None,
     ):
         prune_task = asyncio.create_task(prune_history_periodically())
         try:
-            print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
+            print(f"LiveRecall listening on ws://0.0.0.0:{port}", flush=True)
             await asyncio.Future()
         finally:
+            for client in tuple(CLIENTS.values()):
+                close_client(client, "Server stopping")
             prune_task.cancel()
             with suppress(asyncio.CancelledError):
                 await prune_task
