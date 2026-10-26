@@ -103,6 +103,13 @@ TCPI_BYTES_ACKED = 120
 TCPI_BYTES_RECEIVED = 128
 TCPI_DATA_SEGS_IN = 152
 TCPI_SND_WND = 228
+# Diagnostics only (stuck-client reports): name -> (offset, format)
+TCPI_REPORT = {
+    "retransmits": (2, "<B"), "backoff": (4, "<B"), "rto_ms": (8, "<I"),
+    "unacked": (24, "<I"), "lost": (32, "<I"), "rx_data_ms": (52, "<I"),
+    "rx_ack_ms": (56, "<I"), "rtt_ms": (68, "<I"), "cwnd": (80, "<I"),
+    "total_retrans": (100, "<I"),
+}
 
 
 def env_flag(name: str, default: bool) -> bool:
@@ -174,6 +181,8 @@ MAX_PENDING = 512                      # entries before forced coalescing
 MAX_PENDING_AGE = HISTORY_MAX_SECONDS  # oldest unsent caption older: disconnect
 
 STATS_INTERVAL = 10.0
+REPORT_HELD_AFTER = 2.0      # stats also describe clients held longer than this
+REPORT_HELD_MAX = 10
 
 BACKPRESSURE = env_flag("LIVERECALL_BACKPRESSURE", True)
 PACING = env_flag("LIVERECALL_PACING", True)
@@ -351,6 +360,7 @@ class ClientSession:
         self.hold_onset = 0.0
         self.acked_since: float | None = None
         self.confirm_needed = False   # send a confirmation ping
+        self.confirms = 0             # confirmation pings sent in the current hold
         self.last_confirm_at = -math.inf
         # In-order bytes received from the client when its replies were found
         # stuck behind a lost segment; no new hold until more arrive.
@@ -466,6 +476,7 @@ class ClientSession:
                 if self.confirm_needed:
                     self.confirm_needed = False
                     self.last_confirm_at = self.loop.time()
+                    self.confirms += 1
                     waiter = await self.ws.ping()
                     waiter.add_done_callback(consume_result)
                     continue
@@ -680,6 +691,7 @@ class ClientSession:
         self.lag_seen_at = self.loop.time()
         self.hold_counters = tcp_receive_counters(self.ws)
         self.client_reading = False
+        self.confirms = 0
         # A client that is still reading answers this ping, and that answer
         # reaches our kernel even if an earlier reply is being retransmitted.
         self.confirm_needed = BACKPRESSURE
@@ -692,6 +704,16 @@ class ClientSession:
             self.hold_onset = self.probe_sent_at
         self.acked_since = None
         self.compact()
+
+    def describe(self, now: float) -> str:
+        """One-line state for diagnostics."""
+        state = f"client {self.client_id}: mode={self.mode}"
+        if self.mode == HOLD:
+            state += (f" for {now - self.hold_onset:.1f}s, confirmations={self.confirms}, "
+                      f"all_acked={self.acked_since is not None}, client_reading={self.client_reading}")
+        state += (f", pending={self.n_pending}, written={self.frames_sent}, "
+                  f"last write {now - self.last_write_at:.1f}s ago, probe_backoff={self.probe_backoff:g}")
+        return f"{state}; tcp: {tcp_report(self.ws)}"
 
     def release_hold(self, now: float) -> None:
         """The client answered a later ping while the probe's answer is still
@@ -854,6 +876,30 @@ def set_cork(ws, on: bool) -> bool:
     return True
 
 
+def tcp_report(ws) -> str:
+    """Retransmission and receive state from TCP_INFO, for diagnostics."""
+    info = tcp_info(ws)
+    if info is None:
+        return "n/a"
+    fields = {name: tcp_info_field(info, offset, fmt) for name, (offset, fmt) in TCPI_REPORT.items()}
+    for name in ("rto_ms", "rtt_ms"):
+        if fields[name] is not None:
+            fields[name] //= 1000  # reported in microseconds
+    return " ".join(f"{name}={value}" for name, value in fields.items())
+
+
+def close_description(ws) -> str:
+    """How the connection ended, plus the socket error if the transport failed."""
+    try:
+        text = str(ws.protocol.close_exc)
+    except Exception:  # close state not available
+        text = "unknown"
+    error = getattr(ws, "recv_exc", None)
+    if error is not None and not isinstance(error, ConnectionClosed):
+        text += f" ({type(error).__name__}: {error})"
+    return text
+
+
 def consume_result(future: asyncio.Future) -> None:
     """Done-callback for pings whose result we ignore."""
     if not future.cancelled():
@@ -991,8 +1037,10 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
             await sender
         except (asyncio.CancelledError, ConnectionClosed):
             pass
-        print(f"client disconnected: id={client_id}; clients={len(session.clients)}",
-              flush=True)
+        print(f"client disconnected: id={client_id}; clients={len(session.clients)}; "
+              f"{close_description(ws)}", flush=True)
+        if client.mode == HOLD:
+            print(f"  it was held: {client.describe(client.loop.time())}", flush=True)
 
 
 async def handler(ws) -> None:
@@ -1031,6 +1079,12 @@ def report_stats() -> None:
     print(f"stats: clients={len(clients)} full={modes[FULL]} hold={modes[HOLD]} "
           f"paced={modes[PACED]} queued={queued} history_finals={history} "
           f"probe_backoff={backed_off}", flush=True)
+    now = asyncio.get_running_loop().time()
+    held = sorted((client for client in clients
+                   if client.mode == HOLD and now - client.hold_onset > REPORT_HELD_AFTER),
+                  key=lambda client: client.hold_onset)
+    for client in held[:REPORT_HELD_MAX]:
+        print(f"held: {client.describe(now)}", flush=True)
 
 
 async def housekeeping() -> None:
