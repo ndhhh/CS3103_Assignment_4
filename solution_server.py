@@ -44,17 +44,26 @@ A late pong only starts a HOLD once the kernel reports that the client's TCP
 has acknowledged the ping (or closed its receive window): the ping arrived
 and the application did not answer. A ping still on its way, behind a
 congested link or a lost segment, is network delay; holding the client back
-would only add to it, so the client stays in its mode. A hold only turns into
-pacing if every byte was acknowledged, the client sent us nothing in the
-meantime (it cannot answer pings while it is not reading) and the reading
-rate the stall implies is clearly below the rate we were sending. Otherwise
-the pong was held up in the network (e.g. lost and retransmitted) and the
+would only add to it, so the client stays in its mode.
+
+The pong itself can be lost too, and TCP then waits longer and longer before
+resending it, because the client has nothing else to send. So a held client
+is pinged again every 0.5 s. A client that is not reading cannot answer; one
+that is reading does, and its answers arrive out of order behind the lost one
+(the kernel counts the segment but cannot deliver it). That ends the hold at
+once, with no new hold until the lost data arrives, and the out-of-order
+arrival makes the client's TCP resend the lost reply right away. A hold only
+turns into pacing if every byte was acknowledged, the client sent us nothing
+in the meantime and the reading rate the stall implies is clearly below the
+rate we were sending. Otherwise the pong was held up in the network and the
 client goes back to its previous mode.
 
 A pong that does not ride on the client's ACK costs a packet, which matters
 on a constrained link. Clients with no lag in the last 30 s are therefore
 probed once a second (or every 8 messages, if sooner); lagging or paced
-clients are probed with every message, at most every 0.25 s.
+clients are probed with every message, at most every 0.25 s. Each time a ping
+is found still on its way, that client's probe intervals double (up to 8x),
+so probing backs off on a congested link; a prompt answer halves them again.
 
 Experiment switches (environment variables, inherited by run_demo.py):
     LIVERECALL_BACKPRESSURE=0     no lag probes: always FULL
@@ -119,6 +128,9 @@ PROBE_INTERVAL = 0.25        # at most one lag probe per 0.25 s, only after data
 HEALTHY_PROBE_INTERVAL = 1.0 # no recent lag: a probe per second...
 HEALTHY_PROBE_FRAMES = 8     # ...or after 8 unprobed messages, if sooner
 WATCH_SECONDS = 30.0         # lagged this recently: probe every PROBE_INTERVAL
+PROBE_BACKOFF_MAX = 8.0      # a ping still in the network when checked doubles
+                             # the client's probe intervals (up to 8x); a prompt
+                             # answer halves them again
 LAG_MARGIN = 0.25            # a probe is overdue after min RTT + LAG_MARGIN...
 DELIVERY_GRACE = LAG_MARGIN / 2  # ...and once the client's TCP has acknowledged
                                  # the ping this long ago (the pong may trail
@@ -126,6 +138,11 @@ DELIVERY_GRACE = LAG_MARGIN / 2  # ...and once the client's TCP has acknowledged
 INITIAL_RTT = 0.25           # RTT assumed before the first sample
 RTT_SAMPLES = 32             # min-RTT window
 HOLD_SAMPLE_INTERVAL = 0.1   # kernel send-queue check period while held
+CONFIRM_INTERVAL = 0.5       # while held, ping again this often. A client that
+                             # is reading answers; arriving behind a lost reply,
+                             # the answers show that and make its TCP resend the
+                             # lost one at once instead of after a backed-off
+                             # retransmission timeout
 RECEIVER_CONFIRM = 0.5       # pong still missing this long after the kernel
                              # reported every byte acknowledged: the client
                              # application is not reading
@@ -333,13 +350,19 @@ class ClientSession:
         self.mode_before_hold = FULL
         self.hold_onset = 0.0
         self.acked_since: float | None = None
-        self.confirm_needed = False   # send one confirmation ping per hold
+        self.confirm_needed = False   # send a confirmation ping
+        self.last_confirm_at = -math.inf
+        # In-order bytes received from the client when its replies were found
+        # stuck behind a lost segment; no new hold until more arrive.
+        self.reply_gap: int | None = None
         self.hold_counters: tuple[int, int] | None = None
         self.client_reading = False   # out-of-order client data seen during the hold
 
         self.probe_sent_at: float | None = None
         self.probe_end: int | None = None    # stream position just past the ping
         self.probe_delivered_at: float | None = None
+        self.probe_congested = False         # the ping was still in the network when checked
+        self.probe_backoff = 1.0
         self.last_probe_at = -math.inf
         self.lag_seen_at = -math.inf
         self.rtts: deque[float] = deque(maxlen=RTT_SAMPLES)
@@ -442,6 +465,7 @@ class ClientSession:
                 delay = self.poll(self.loop.time())
                 if self.confirm_needed:
                     self.confirm_needed = False
+                    self.last_confirm_at = self.loop.time()
                     waiter = await self.ws.ping()
                     waiter.add_done_callback(consume_result)
                     continue
@@ -462,8 +486,13 @@ class ClientSession:
         if self.probe_sent_at is not None and self.mode != HOLD:
             expected = self.probe_sent_at + self.rtt_min  # pong due on a clear path
             check_at = expected + DELIVERY_GRACE
-            if self.probe_delivered_at is None and now >= check_at and self.ping_delivered():
-                self.probe_delivered_at = now
+            if self.probe_delivered_at is None and now >= check_at:
+                if self.ping_delivered():
+                    self.probe_delivered_at = now
+                elif not self.probe_congested:
+                    # Queued or lost on the way: probe this client less often.
+                    self.probe_congested = True
+                    self.probe_backoff = min(PROBE_BACKOFF_MAX, 2 * self.probe_backoff)
             if self.probe_delivered_at is None:
                 # Still in the network (or answered before the check): no
                 # sign of a slow reader yet, keep sending and look again.
@@ -485,7 +514,12 @@ class ClientSession:
                     # tell), yet the pong is missing.
                     self.acked_since = now
             self.watch_client_data()
-            return HOLD_SAMPLE_INTERVAL  # keep watching until on_pong() ends the hold
+            if self.client_reading:
+                self.release_hold(now)  # and carry on sending below
+            else:
+                if now - self.last_confirm_at >= CONFIRM_INTERVAL:
+                    self.confirm_needed = BACKPRESSURE
+                return HOLD_SAMPLE_INTERVAL  # keep watching until on_pong() ends the hold
 
         if self.mode == PACED:
             retry_at = self.paced_since + self.retry_after
@@ -568,16 +602,18 @@ class ClientSession:
         if not BACKPRESSURE or self.probe_sent_at is not None:
             return False
         since = now - self.last_probe_at
-        if since < PROBE_INTERVAL:
+        backoff = self.probe_backoff
+        if since < PROBE_INTERVAL * backoff:
             return False
         if self.mode != FULL or now - self.lag_seen_at < WATCH_SECONDS:
             return True
-        return (since >= HEALTHY_PROBE_INTERVAL
-                or self.frames_sent - self.frames_at_probe >= HEALTHY_PROBE_FRAMES)
+        return (since >= HEALTHY_PROBE_INTERVAL * backoff
+                or self.frames_sent - self.frames_at_probe >= HEALTHY_PROBE_FRAMES * backoff)
 
     async def probe(self, now: float) -> None:
         self.probe_sent_at = self.last_probe_at = now
         self.probe_delivered_at = None
+        self.probe_congested = False
         self.frames_at_probe = self.frames_sent
         self.probe_last_write = self.last_write_at
         waiter = await self.ws.ping()
@@ -587,6 +623,11 @@ class ClientSession:
     def ping_delivered(self) -> bool:
         """Has the client's TCP received the outstanding probe? True when the
         platform cannot tell, so any late pong then counts as lag."""
+        if self.reply_gap is not None:
+            counters = tcp_receive_counters(self.ws)
+            if counters is not None and counters[0] == self.reply_gap:
+                return False  # its answer is stuck behind the lost reply
+            self.reply_gap = None
         info = tcp_info(self.ws)
         acked = tcp_info_field(info, TCPI_BYTES_ACKED, "<Q")
         if self.probe_end is None or acked is None:
@@ -601,6 +642,8 @@ class ClientSession:
         if failed:
             return
         now = self.loop.time()
+        if not self.probe_congested:
+            self.probe_backoff = max(1.0, self.probe_backoff / 2)
         if self.mode == HOLD:
             self.leave_hold(now, now - sent_at)
         else:
@@ -649,6 +692,20 @@ class ClientSession:
             self.hold_onset = self.probe_sent_at
         self.acked_since = None
         self.compact()
+
+    def release_hold(self, now: float) -> None:
+        """The client answered a later ping while the probe's answer is still
+        missing: it is reading, and that answer was lost on the way back.
+        Resume now instead of waiting for TCP to resend it, and do not hold
+        again until the lost data has arrived."""
+        counters = tcp_receive_counters(self.ws)
+        self.reply_gap = counters[0] if counters is not None else None
+        self.probe_sent_at = None  # its late pong is ignored
+        self.mode = self.mode_before_hold
+        self.catching_up = self.n_pending > 0
+        self.tokens_at = now
+        print(f"client {self.client_id}: {now - self.hold_onset:.1f}s stall treated as "
+              "network delay, not a slow reader (client answered a later ping)", flush=True)
 
     def leave_hold(self, now: float, probe_rtt: float) -> None:
         stall = now - self.hold_onset
@@ -970,8 +1027,10 @@ def report_stats() -> None:
     modes = Counter(client.mode for client in clients)
     queued = sum(client.n_pending for client in clients)
     history = sum(len(session.finals) for session in SESSIONS.values())
+    backed_off = sum(client.probe_backoff > 1 for client in clients)
     print(f"stats: clients={len(clients)} full={modes[FULL]} hold={modes[HOLD]} "
-          f"paced={modes[PACED]} queued={queued} history_finals={history}", flush=True)
+          f"paced={modes[PACED]} queued={queued} history_finals={history} "
+          f"probe_backoff={backed_off}", flush=True)
 
 
 async def housekeeping() -> None:
