@@ -26,6 +26,12 @@ Delivery modes (per client)
            finals first, so few (and only current) messages wait in its
            receive buffer.
 
+Catch-up: when a lagging client has two or more unsent finals, they are sent
+together as one HISTORY message (finals only, oldest first, none the client
+already holds), so a slow reader spends one read on them instead of one per
+final. Only clients that joined with nothing to recover get this; a resumed
+or late-joining connection keeps exactly one HISTORY, its recovery reply.
+
 Lag probes: after writing data the sender sends a WebSocket ping. The client
 answers only once it has read everything sent before the ping. A websockets
 client keeps reading until 16 unread messages are queued and then stops
@@ -36,8 +42,7 @@ stay empty in that case because the client's kernel keeps accepting data.
 Experiment switches (environment variables, inherited by run_demo.py):
     LIVERECALL_BACKPRESSURE=0     no lag probes: always FULL
     LIVERECALL_PACING=0           HOLD/coalescing only, never PACED
-    LIVERECALL_CATCHUP_HISTORY=1  send several missed finals to a lagging
-                                  client as one HISTORY message
+    LIVERECALL_CATCHUP_HISTORY=0  never batch finals into a catch-up HISTORY
 """
 
 from __future__ import annotations
@@ -114,7 +119,7 @@ STATS_INTERVAL = 10.0
 
 BACKPRESSURE = env_flag("LIVERECALL_BACKPRESSURE", True)
 PACING = env_flag("LIVERECALL_PACING", True)
-CATCHUP_HISTORY = env_flag("LIVERECALL_CATCHUP_HISTORY", False)
+CATCHUP_HISTORY = env_flag("LIVERECALL_CATCHUP_HISTORY", True)
 CATCHUP_MIN_FINALS = 2
 CATCHUP_MAX_FINALS = 200
 
@@ -281,6 +286,7 @@ class ClientSession:
         self.n_pending = 0
         self.preamble: deque[str] = deque()  # HISTORY reply, sent before anything else
         self.catching_up = False             # backlog left over from a HOLD
+        self.catchup_allowed = False         # may receive catch-up HISTORY messages
 
         self.mode = FULL
         self.mode_before_hold = FULL
@@ -438,7 +444,7 @@ class ClientSession:
 
     async def send_next(self) -> None:
         batch = []
-        if CATCHUP_HISTORY and (self.mode != FULL or self.catching_up):
+        if self.catchup_allowed and (self.mode != FULL or self.catching_up):
             batch = self.leading_finals()
         if len(batch) >= CATCHUP_MIN_FINALS:
             for _ in batch:
@@ -691,6 +697,10 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
               else history_window(hello.get("history_seconds")))
 
     client = ClientSession(ws, client_id, session)
+    # Catch-up HISTORY only for clients that start with nothing to recover. A
+    # resumed or late-joining connection gets exactly one HISTORY (its
+    # recovery reply), so its recovery is never confused with catch-up.
+    client.catchup_allowed = CATCHUP_HISTORY and last_segment == 0 and not session.finals
     # Snapshot and subscribe with no await in between: every accepted caption
     # reaches this client exactly once, either in HISTORY or live.
     missed = session.finals_after(last_segment, last_revision, window, client.loop.time())
