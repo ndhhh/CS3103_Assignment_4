@@ -46,6 +46,7 @@ SCENARIOS=(
   "t5_loss_3pct     loss_3pct         --clients 100"
   "bw2mbit_100      bandwidth_2mbit   --clients 100"
   "bw2mbit_300      bandwidth_2mbit   --clients 300"
+  "bw2mbit_500      bandwidth_2mbit   --clients 500"  # more than 2 Mbit/s of captions
 )
 
 selected() { [ -z "$ONLY" ] || [[ " $ONLY " == *" $1 "* ]]; }
@@ -68,7 +69,7 @@ run_scenario() {  # run_scenario <label> <run_demo.py args...>
 
 mkdir -p "$OUT"
 sudo -v
-# Keep the sudo credential fresh during the ~25 minute run.
+# Keep the sudo credential fresh during the ~26 minute run.
 ( while sleep 60; do sudo -n -v 2>/dev/null || exit 0; done ) >/dev/null 2>&1 &
 KEEPALIVE=$!
 stop_keepalive() { pkill -P "$KEEPALIVE" 2>/dev/null || true; kill "$KEEPALIVE" 2>/dev/null || true; }
