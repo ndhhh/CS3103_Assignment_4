@@ -65,6 +65,13 @@ clients are probed with every message, at most every 0.25 s. Each time a ping
 is found still on its way, that client's probe intervals double (up to 8x),
 so probing backs off on a congested link; a prompt answer halves them again.
 
+No probes at all while the path queues: when TCP's smoothed RTT is more than
+0.2 s above the connection's minimum RTT, the client is not probed until it is
+back within 0.1 s. On an overloaded link the pongs compete with captions and
+get lost, and under heavy local drops Linux was seen to abort such two-way
+connections with ETIMEDOUT within seconds, without the client noticing. A
+slow reader on a congested path is then handled like any other client.
+
 Experiment switches (environment variables, inherited by run_demo.py):
     LIVERECALL_BACKPRESSURE=0     no lag probes: always FULL
     LIVERECALL_PACING=0           HOLD/coalescing only, never PACED
@@ -103,6 +110,8 @@ TCPI_BYTES_ACKED = 120
 TCPI_BYTES_RECEIVED = 128
 TCPI_DATA_SEGS_IN = 152
 TCPI_SND_WND = 228
+TCPI_RTT = 68                # smoothed RTT, microseconds
+TCPI_MIN_RTT = 148           # minimum RTT seen, microseconds
 # Diagnostics only (stuck-client reports): name -> (offset, format)
 TCPI_REPORT = {
     "retransmits": (2, "<B"), "backoff": (4, "<B"), "rto_ms": (8, "<I"),
@@ -138,6 +147,8 @@ WATCH_SECONDS = 30.0         # lagged this recently: probe every PROBE_INTERVAL
 PROBE_BACKOFF_MAX = 8.0      # a ping still in the network when checked doubles
                              # the client's probe intervals (up to 8x); a prompt
                              # answer halves them again
+QUEUEING_STOP = 0.2          # no probes while TCP's RTT is this far above the
+QUEUEING_RESUME = 0.1        # connection's minimum, until it is back under this
 LAG_MARGIN = 0.25            # a probe is overdue after min RTT + LAG_MARGIN...
 DELIVERY_GRACE = LAG_MARGIN / 2  # ...and once the client's TCP has acknowledged
                                  # the ping this long ago (the pong may trail
@@ -373,6 +384,7 @@ class ClientSession:
         self.probe_delivered_at: float | None = None
         self.probe_congested = False         # the ping was still in the network when checked
         self.probe_backoff = 1.0
+        self.queueing = False                # path congested: no probes (link_queueing)
         self.last_probe_at = -math.inf
         self.lag_seen_at = -math.inf
         self.rtts: deque[float] = deque(maxlen=RTT_SAMPLES)
@@ -616,10 +628,27 @@ class ClientSession:
         backoff = self.probe_backoff
         if since < PROBE_INTERVAL * backoff:
             return False
-        if self.mode != FULL or now - self.lag_seen_at < WATCH_SECONDS:
+        if not (self.mode != FULL or now - self.lag_seen_at < WATCH_SECONDS
+                or since >= HEALTHY_PROBE_INTERVAL * backoff
+                or self.frames_sent - self.frames_at_probe >= HEALTHY_PROBE_FRAMES * backoff):
+            return False
+        return not self.link_queueing()
+
+    def link_queueing(self) -> bool:
+        """Is the path to this client queueing? TCP's smoothed RTT more than
+        QUEUEING_STOP above the connection's minimum RTT stops probing until it
+        is back under QUEUEING_RESUME. Without an RTT sample yet, wait."""
+        info = tcp_info(self.ws)
+        rtt = tcp_info_field(info, TCPI_RTT, "<I")
+        min_rtt = tcp_info_field(info, TCPI_MIN_RTT, "<I")
+        if rtt is None or min_rtt is None:
+            return False  # platform cannot tell: probe as usual
+        if rtt == 0:
             return True
-        return (since >= HEALTHY_PROBE_INTERVAL * backoff
-                or self.frames_sent - self.frames_at_probe >= HEALTHY_PROBE_FRAMES * backoff)
+        queueing = (rtt - min_rtt) / 1e6
+        limit = QUEUEING_RESUME if self.queueing else QUEUEING_STOP
+        self.queueing = queueing > limit
+        return self.queueing
 
     async def probe(self, now: float) -> None:
         self.probe_sent_at = self.last_probe_at = now
@@ -1076,9 +1105,10 @@ def report_stats() -> None:
     queued = sum(client.n_pending for client in clients)
     history = sum(len(session.finals) for session in SESSIONS.values())
     backed_off = sum(client.probe_backoff > 1 for client in clients)
+    queueing = sum(client.queueing for client in clients)
     print(f"stats: clients={len(clients)} full={modes[FULL]} hold={modes[HOLD]} "
           f"paced={modes[PACED]} queued={queued} history_finals={history} "
-          f"probe_backoff={backed_off}", flush=True)
+          f"probe_backoff={backed_off} queueing={queueing}", flush=True)
     now = asyncio.get_running_loop().time()
     held = sorted((client for client in clients
                    if client.mode == HOLD and now - client.hold_onset > REPORT_HELD_AFTER),
