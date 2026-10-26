@@ -18,9 +18,10 @@ Data path
 Delivery modes (per client)
 ---------------------------
     FULL   normal operation: every accepted revision is forwarded in order.
-    HOLD   a lag probe is overdue, so the client or the network is not keeping
-           up. Nothing is written; a newer revision replaces the unsent older
-           revisions of the same segment. Finals are never dropped.
+    HOLD   a lag probe reached the client's TCP but its application has not
+           answered it, so the client may have stopped reading. Nothing is
+           written; a newer revision replaces the unsent older revisions of
+           the same segment. Finals are never dropped.
     PACED  the client application reads slower than the caption stream. Its
            messages are rate-limited to just below its measured reading rate,
            finals first, so few (and only current) messages wait in its
@@ -37,12 +38,23 @@ answers only once it has read everything sent before the ping. A websockets
 client keeps reading until 16 unread messages are queued and then stops
 reading from TCP until its application has worked the queue down to 4, so an
 overdue pong is the earliest sign of a slow reader. Server-side send buffers
-stay empty in that case because the client's kernel keeps accepting data. A
-stall only counts as a slow reader if every byte was acknowledged, the client
-sent us nothing in the meantime (it cannot answer pings while it is not
-reading) and the reading rate the stall implies is clearly below the rate we
-were sending. Otherwise the pong was held up in the network (e.g. lost and
-retransmitted) and the client goes back to its previous mode.
+stay empty in that case because the client's kernel keeps accepting data.
+
+A late pong only starts a HOLD once the kernel reports that the client's TCP
+has acknowledged the ping (or closed its receive window): the ping arrived
+and the application did not answer. A ping still on its way, behind a
+congested link or a lost segment, is network delay; holding the client back
+would only add to it, so the client stays in its mode. A hold only turns into
+pacing if every byte was acknowledged, the client sent us nothing in the
+meantime (it cannot answer pings while it is not reading) and the reading
+rate the stall implies is clearly below the rate we were sending. Otherwise
+the pong was held up in the network (e.g. lost and retransmitted) and the
+client goes back to its previous mode.
+
+A pong that does not ride on the client's ACK costs a packet, which matters
+on a constrained link. Clients with no lag in the last 30 s are therefore
+probed once a second (or every 8 messages, if sooner); lagging or paced
+clients are probed with every message, at most every 0.25 s.
 
 Experiment switches (environment variables, inherited by run_demo.py):
     LIVERECALL_BACKPRESSURE=0     no lag probes: always FULL
@@ -77,8 +89,11 @@ except (ImportError, AttributeError):  # not Linux: kernel send queue unknown
 
 TCP_INFO = getattr(socket, "TCP_INFO", None)  # Linux only
 TCP_CORK = getattr(socket, "TCP_CORK", None)  # Linux only
-TCPI_BYTES_RECEIVED = 128  # struct tcp_info offsets (u64, u32), Linux >= 4.6
+# struct tcp_info offsets: u64 fields since Linux 4.6, snd_wnd since 5.4
+TCPI_BYTES_ACKED = 120
+TCPI_BYTES_RECEIVED = 128
 TCPI_DATA_SEGS_IN = 152
+TCPI_SND_WND = 228
 
 
 def env_flag(name: str, default: bool) -> bool:
@@ -98,10 +113,16 @@ DEFAULT_HISTORY_SECONDS = 30.0
 
 # Lag detection.
 PROBE_INTERVAL = 0.25        # at most one lag probe per 0.25 s, only after data.
-                             # The ping shares the caption's TCP segment (corked)
-                             # and the pong rides on the client's ACK, so probes
-                             # add ~16 bytes and no packets
-LAG_MARGIN = 0.25            # a probe is overdue after min RTT + LAG_MARGIN
+                             # The ping shares the caption's TCP segment (corked);
+                             # the pong rides on the client's ACK only if the
+                             # client answers at once, otherwise it is a packet
+HEALTHY_PROBE_INTERVAL = 1.0 # no recent lag: a probe per second...
+HEALTHY_PROBE_FRAMES = 8     # ...or after 8 unprobed messages, if sooner
+WATCH_SECONDS = 30.0         # lagged this recently: probe every PROBE_INTERVAL
+LAG_MARGIN = 0.25            # a probe is overdue after min RTT + LAG_MARGIN...
+DELIVERY_GRACE = LAG_MARGIN / 2  # ...and once the client's TCP has acknowledged
+                                 # the ping this long ago (the pong may trail
+                                 # the ACK by jitter or a busy client)
 INITIAL_RTT = 0.25           # RTT assumed before the first sample
 RTT_SAMPLES = 32             # min-RTT window
 HOLD_SAMPLE_INTERVAL = 0.1   # kernel send-queue check period while held
@@ -317,11 +338,15 @@ class ClientSession:
         self.client_reading = False   # out-of-order client data seen during the hold
 
         self.probe_sent_at: float | None = None
+        self.probe_end: int | None = None    # stream position just past the ping
+        self.probe_delivered_at: float | None = None
         self.last_probe_at = -math.inf
+        self.lag_seen_at = -math.inf
         self.rtts: deque[float] = deque(maxlen=RTT_SAMPLES)
         self.rtt_min = INITIAL_RTT
         self.frames_sent = 0
         self.frames_at_probe = 0
+        self.frames_confirmed = 0            # frames_at_probe of the last answered probe
         self.write_times: deque[float] = deque(maxlen=256)
         self.last_write_at = 0.0
         self.probe_last_write = 0.0
@@ -435,18 +460,29 @@ class ClientSession:
         now, otherwise how long to wait (None: until woken)."""
         deadline = None
         if self.probe_sent_at is not None and self.mode != HOLD:
-            overdue_at = self.probe_sent_at + self.rtt_min + LAG_MARGIN
-            if now >= overdue_at:
-                self.enter_hold()
+            expected = self.probe_sent_at + self.rtt_min  # pong due on a clear path
+            check_at = expected + DELIVERY_GRACE
+            if self.probe_delivered_at is None and now >= check_at and self.ping_delivered():
+                self.probe_delivered_at = now
+            if self.probe_delivered_at is None:
+                # Still in the network (or answered before the check): no
+                # sign of a slow reader yet, keep sending and look again.
+                deadline = check_at if now < check_at else now + HOLD_SAMPLE_INTERVAL
             else:
-                deadline = overdue_at
+                overdue_at = max(expected + LAG_MARGIN, self.probe_delivered_at + DELIVERY_GRACE)
+                if now >= overdue_at:
+                    self.enter_hold()
+                else:
+                    deadline = overdue_at
 
         if self.mode == HOLD:
             if self.acked_since is None:
                 outstanding = unacked_bytes(self.ws)
-                if outstanding is None or outstanding == 0:
-                    # Everything we wrote has reached the client's kernel (or
-                    # the platform cannot tell), yet the pong is missing.
+                if (outstanding is None or outstanding == 0
+                        or tcp_info_field(tcp_info(self.ws), TCPI_SND_WND, "<I") == 0):
+                    # Everything we wrote has reached the client's kernel, or
+                    # its receive buffer is full (or the platform cannot
+                    # tell), yet the pong is missing.
                     self.acked_since = now
             self.watch_client_data()
             return HOLD_SAMPLE_INTERVAL  # keep watching until on_pong() ends the hold
@@ -486,8 +522,7 @@ class ClientSession:
         if not self.pending:
             self.catching_up = False
 
-        probe_due = (BACKPRESSURE and self.probe_sent_at is None
-                     and self.loop.time() - self.last_probe_at >= PROBE_INTERVAL)
+        probe_due = self.probe_due(self.loop.time())
         # Cork so the caption and its probe ping leave in one TCP segment.
         corked = probe_due and set_cork(self.ws, True)
         try:
@@ -528,12 +563,35 @@ class ClientSession:
 
     # Lag probes and mode changes ------------------------------------------
 
+    def probe_due(self, now: float) -> bool:
+        """Should the message about to be written carry a lag probe?"""
+        if not BACKPRESSURE or self.probe_sent_at is not None:
+            return False
+        since = now - self.last_probe_at
+        if since < PROBE_INTERVAL:
+            return False
+        if self.mode != FULL or now - self.lag_seen_at < WATCH_SECONDS:
+            return True
+        return (since >= HEALTHY_PROBE_INTERVAL
+                or self.frames_sent - self.frames_at_probe >= HEALTHY_PROBE_FRAMES)
+
     async def probe(self, now: float) -> None:
         self.probe_sent_at = self.last_probe_at = now
+        self.probe_delivered_at = None
         self.frames_at_probe = self.frames_sent
         self.probe_last_write = self.last_write_at
         waiter = await self.ws.ping()
+        self.probe_end = stream_position(self.ws)
         waiter.add_done_callback(lambda done, sent_at=now: self.on_pong(done, sent_at))
+
+    def ping_delivered(self) -> bool:
+        """Has the client's TCP received the outstanding probe? True when the
+        platform cannot tell, so any late pong then counts as lag."""
+        info = tcp_info(self.ws)
+        acked = tcp_info_field(info, TCPI_BYTES_ACKED, "<Q")
+        if self.probe_end is None or acked is None:
+            return True
+        return acked >= self.probe_end or tcp_info_field(info, TCPI_SND_WND, "<I") == 0
 
     def on_pong(self, waiter: asyncio.Future, sent_at: float) -> None:
         failed = waiter.cancelled() or waiter.exception() is not None
@@ -548,6 +606,7 @@ class ClientSession:
         else:
             self.add_rtt(now - sent_at)
         self.confirmed_write_at = self.probe_last_write
+        self.frames_confirmed = self.frames_at_probe
         self.wake.set()
 
     def add_rtt(self, rtt: float) -> None:
@@ -575,6 +634,7 @@ class ClientSession:
     def enter_hold(self) -> None:
         self.mode_before_hold = self.mode
         self.mode = HOLD
+        self.lag_seen_at = self.loop.time()
         self.hold_counters = tcp_receive_counters(self.ws)
         self.client_reading = False
         # A client that is still reading answers this ping, and that answer
@@ -626,8 +686,14 @@ class ClientSession:
         self.mode = PACED
         # Token debt: let the client read the messages still queued on its
         # side (RESUME_QUEUE plus anything written after the overdue probe)
-        # before sending more, so what it reads next is current.
-        still_queued = RESUME_QUEUE + (self.frames_sent - self.frames_at_probe)
+        # before sending more, so what it reads next is current. It stopped
+        # reading somewhere after the last answered probe, so messages
+        # written between that probe and the overdue one may be queued too.
+        # Probing every message, that is only the overdue probe's own
+        # caption, which RESUME_QUEUE was measured with; a client probed
+        # once a second can have several.
+        unconfirmed = max(0, self.frames_at_probe - self.frames_confirmed - 1)
+        still_queued = RESUME_QUEUE + unconfirmed + (self.frames_sent - self.frames_at_probe)
         self.tokens = 1.0 - still_queued
         self.tokens_at = now
         self.paced_since = now
@@ -638,6 +704,7 @@ class ClientSession:
         """Stall-free for a while: try full-rate delivery again."""
         self.mode = FULL
         self.retried = True
+        self.lag_seen_at = self.loop.time()  # keep probing it closely
         print(f"client {self.client_id}: no stall for {self.retry_after:.0f}s; "
               "trying full rate again", flush=True)
 
@@ -675,20 +742,45 @@ def unacked_bytes(ws) -> int | None:
     return kernel + transport.get_write_buffer_size()
 
 
-def tcp_receive_counters(ws) -> tuple[int, int] | None:
-    """(in-order bytes received, data segments received) from Linux TCP_INFO."""
+def tcp_info(ws) -> bytes | None:
+    """Linux TCP_INFO of the connection's socket."""
     transport = ws.transport
     sock = transport.get_extra_info("socket") if transport is not None else None
     if TCP_INFO is None or sock is None:
         return None
     try:
-        info = sock.getsockopt(socket.IPPROTO_TCP, TCP_INFO, 256)
+        return sock.getsockopt(socket.IPPROTO_TCP, TCP_INFO, 256)
     except OSError:
         return None
-    if len(info) < TCPI_DATA_SEGS_IN + 4:
+
+
+def tcp_info_field(info: bytes | None, offset: int, fmt: str) -> int | None:
+    """One struct tcp_info field, or None if this kernel does not report it."""
+    if info is None or len(info) < offset + struct.calcsize(fmt):
         return None
-    return (struct.unpack_from("<Q", info, TCPI_BYTES_RECEIVED)[0],
-            struct.unpack_from("<I", info, TCPI_DATA_SEGS_IN)[0])
+    return struct.unpack_from(fmt, info, offset)[0]
+
+
+def tcp_receive_counters(ws) -> tuple[int, int] | None:
+    """(in-order bytes received, data segments received) from Linux TCP_INFO."""
+    info = tcp_info(ws)
+    delivered = tcp_info_field(info, TCPI_BYTES_RECEIVED, "<Q")
+    segments = tcp_info_field(info, TCPI_DATA_SEGS_IN, "<I")
+    if delivered is None or segments is None:
+        return None
+    return delivered, segments
+
+
+def stream_position(ws) -> int | None:
+    """Bytes handed to the connection so far: acknowledged plus still queued.
+    The queue is read first, so an ACK arriving in between can only move the
+    result later (a ping then counts as delivered slightly late), never
+    earlier."""
+    queued = unacked_bytes(ws)
+    acked = tcp_info_field(tcp_info(ws), TCPI_BYTES_ACKED, "<Q")
+    if queued is None or acked is None:
+        return None
+    return acked + queued
 
 
 def set_cork(ws, on: bool) -> bool:
