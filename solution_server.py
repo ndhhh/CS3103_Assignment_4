@@ -78,7 +78,7 @@ client much farther away than the others would look congested and simply not
 be probed.
 
 Lean delivery on an overloaded link: when a message sent to a client is still
-unacknowledged after 1 s and the path is queueing (TCP's RTT more than 0.2 s
+unacknowledged after 1 s and the path is queueing (TCP's RTT more than 0.4 s
 above the base RTT), that client's share of the link cannot carry the
 caption stream, and everything handed to TCP queues behind it (lost segments
 hold up all later ones). A late message on a path that is not queueing (a
@@ -89,8 +89,8 @@ of the same segment. Finals never wait: they are written at once (waiting
 finals as one catch-up HISTORY). What is sent is therefore current, and
 fewer bytes compete for the link. The wait applies only while TCP's smoothed
 RTT is at least 50 ms, so a lean client whose link recovers gets every
-revision again at once; it returns to normal delivery once its path has not
-been queueing for 10 s. Lean clients are not probed.
+revision again at once; it returns to normal delivery once queueing has
+stayed under 0.2 s for 10 s. Lean clients are not probed.
 
 Experiment switches (environment variables, inherited by run_demo.py):
     LIVERECALL_BACKPRESSURE=0     no lag probes: always FULL
@@ -209,8 +209,10 @@ PACED_RETRY_SECONDS = 60.0   # stall-free this long: try full rate again
 PACED_RETRY_MAX = 600.0
 
 # Lean delivery on an overloaded link (one message in flight, coalescing).
-LEAN_ENTER_AGE = 1.0         # a message unacknowledged this long on a queueing path: go lean
-LEAN_EXIT_SECONDS = 10.0     # path not queueing (QUEUEING_STOP) this long: back to normal
+LEAN_ENTER_AGE = 1.0         # a message unacknowledged this long...
+LEAN_QUEUEING = 0.4          # ...while TCP's RTT is this far above the base RTT: go lean
+                             # (jitter plus a lost packet reached ~0.36 s; overload ~0.7 s)
+LEAN_EXIT_SECONDS = 10.0     # queueing under QUEUEING_STOP this long: back to normal
 LINK_TICK = 0.05             # how often waiting lean clients are checked for an ACK
 LEAN_GATE_RTT = 0.05         # one message in flight only if TCP's RTT is at least this
 LINK_CHECK_INTERVAL = 0.25   # how often every client's oldest unacknowledged message is checked
@@ -619,9 +621,9 @@ class ClientSession:
 
     def check_link(self, now: float) -> None:
         """Go lean when a message has been unacknowledged for LEAN_ENTER_AGE
-        on a queueing path (a single loss on an uncongested path does not
-        count); go back once the path has not been queueing for
-        LEAN_EXIT_SECONDS."""
+        while the path queues by more than LEAN_QUEUEING (a lost packet on a
+        jittery path does not count); go back once queueing has stayed under
+        QUEUEING_STOP for LEAN_EXIT_SECONDS."""
         acked = tcp_info_field(tcp_info(self.ws), TCPI_BYTES_ACKED, "<Q")
         if acked is None:
             return
@@ -630,9 +632,10 @@ class ClientSession:
             writes.popleft()
         age = now - writes[0][1] if writes else 0.0
         delay = self.queueing_delay()
-        queueing = delay is not None and delay != math.inf and delay > QUEUEING_STOP
+        known = delay is not None and delay != math.inf
+        queueing = known and delay > QUEUEING_STOP
         if not self.lean:
-            if age > LEAN_ENTER_AGE and queueing:
+            if age > LEAN_ENTER_AGE and known and delay > LEAN_QUEUEING:
                 self.lean = True
                 self.lean_calm_since = None
                 print(f"client {self.client_id}: a message unacknowledged for {age:.1f}s, "
