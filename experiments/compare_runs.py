@@ -9,7 +9,9 @@ scenario found, it prints the median across runs of the main metrics, the
 lowest per-run final completeness, how many clients went silent (nothing
 received in the last 10 s of a run, from the CSV) and, when the scenario's
 server log is present, how many clients the server paced as slow readers and
-how many of those the load client had not made slow ("paced/wrong").
+how many of those the load client had not made slow ("paced/wrong"), and how
+many connections the server's kernel aborted with ETIMEDOUT ("aborts", from
+the close reasons this server logs; "-" for a server that logs none).
 Public-test folders hold several servers' files with an "ours_" or
 "teammate_" prefix; each prefix gets its own row (folder:ours, ...).
 """
@@ -86,13 +88,19 @@ def slow_ids(csv_path: str) -> set[str]:
         return {row["client_id"] for row in csv.DictReader(f) if row["slow"] == "1"}
 
 
-def decisions(paths: list[str]) -> str:
-    """Clients paced as slow readers in the scenario's server log, and how
-    many of them the load client had not made slow (paced/wrong)."""
+def server_log(paths: list[str]) -> str | None:
+    """The scenario's log (run_demo.py output, server lines included)."""
     log = re.sub(r"_run\d\d\.json$", "", paths[0]) + ".log"
     if not os.path.exists(log):
+        return None
+    return open(log, encoding="utf-8", errors="replace").read()
+
+
+def decisions(text: str | None, paths: list[str]) -> str:
+    """Clients paced as slow readers in the scenario's server log, and how
+    many of them the load client had not made slow (paced/wrong)."""
+    if text is None:
         return "-"
-    text = open(log, encoding="utf-8", errors="replace").read()
     # One server start per run; the runs' logs follow each other in order.
     per_run = text.split("LiveRecall server listening")[1:] or [text]
     paced = wrong = 0
@@ -101,6 +109,13 @@ def decisions(paths: list[str]) -> str:
         paced += len(ids)
         wrong += len(ids - slow_ids(path[:-5] + ".csv"))
     return f"{paced}/{wrong}"
+
+
+def aborts(text: str | None) -> str:
+    """Connections the server's kernel gave up on (ETIMEDOUT)."""
+    if text is None or "client disconnected: id=" not in text:
+        return "-"
+    return str(text.count("Connection timed out"))
 
 
 def row(paths: list[str]) -> list[str]:
@@ -115,7 +130,9 @@ def row(paths: list[str]) -> list[str]:
     cells.append(str(sum((value(s, "duplicates") or 0) + (value(s, "stale") or 0) for s in summaries)))
     silent = [silent_clients(p[:-5] + ".csv") for p in paths]
     cells.append("/".join("-" if s is None else str(s) for s in silent))
-    cells.append(decisions(paths))
+    text = server_log(paths)
+    cells.append(decisions(text, paths))
+    cells.append(aborts(text))
     cells.append(str(len(paths)))
     return cells
 
@@ -131,7 +148,7 @@ def main() -> None:
     scenarios = sorted({s for runs in per_folder for s in runs})
     labels = [label for runs in per_folder for by_label in runs.values() for label in by_label]
     headers = ["folder"] + [c[0] for c in COLUMNS] + ["minCompl", "errors", "dup+stale",
-                                                      "silent", "paced/wrong", "runs"]
+                                                      "silent", "paced/wrong", "aborts", "runs"]
     widths = [max(map(len, labels + ["folder"])) + 2] + [max(9, len(h) + 2) for h in headers[1:]]
     for scenario in scenarios:
         if only and scenario not in only:
