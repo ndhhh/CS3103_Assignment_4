@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""Trace what TCP tells the server about each client's reading, for a design
-measurement: does the receive window show when a client application stops
-reading, and how fast it reads?
+"""Trace what TCP tells the server about each client, for design measurements.
 
-    python experiments/trace_receive_window.py run OUT_DIR [--clients 100 ...]
-    python experiments/trace_receive_window.py analyse OUT_DIR
+    python experiments/trace_tcp_feedback.py run OUT_DIR [--clients 100 ...]
+    python experiments/trace_tcp_feedback.py window OUT_DIR
+    python experiments/trace_tcp_feedback.py ages OUT_DIR
+    python experiments/trace_tcp_feedback.py summary DIR [DIR ...]
 
 `run` starts the server from the current checkout in this process (code
 unchanged; experiment switches via --server-env), the supplied
 load_clients.py and caption_source.py, and samples every client connection
 every --interval seconds: bytes the client's TCP acknowledged (snd_una), the
-window the client advertises, its window scale and the bytes and messages
-written. The client CSV (clients.csv) records which clients are slow and
-when their application read each message. `analyse` compares the receive
-window's right edge (acknowledged + window) with what was acknowledged.
-Apply a network profile to lo beforehand to trace under impairment.
+window the client advertises, its window scale, the bytes and messages
+written, and how long the oldest message not yet acknowledged has been
+waiting (every write's end position in the stream is recorded). The client
+CSV (clients.csv) records which clients are slow and when their application
+read each message. Apply a network profile to lo beforehand to trace under
+impairment.
+
+`window` asks whether the receive window's right edge (acknowledged +
+window) shows a client application that stops reading. `ages` gives the
+distribution of the oldest-unacknowledged age and the share of time it is
+above candidate limits D; `summary` prints that for several trace folders.
 """
 
 from __future__ import annotations
@@ -29,7 +35,9 @@ import statistics
 import struct
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+
+LIMITS = (0.25, 0.3, 0.4, 0.5)  # candidate D values, seconds
 
 
 def run(args) -> None:
@@ -38,6 +46,17 @@ def run(args) -> None:
         os.environ[key] = value
     sys.path.insert(0, os.getcwd())
     import solution_server as server  # noqa: E402  flags are read at import
+
+    original_write = server.ClientSession.write
+
+    async def write(self, text):
+        """The server's write, plus where the message ends in the stream."""
+        await original_write(self, text)
+        end = server.stream_position(self.ws)
+        if end is not None:
+            self.__dict__.setdefault("trace_writes", deque()).append((end, time.time()))
+
+    server.ClientSession.write = write
 
     os.makedirs(args.out, exist_ok=True)
     samples_path = os.path.join(args.out, "samples.csv")
@@ -56,9 +75,13 @@ def run(args) -> None:
                     window = struct.unpack_from("<I", info, server.TCPI_SND_WND)[0]
                     wscale = info[6] & 0x0F  # tcpi_snd_wscale: the client's window scale
                     written = server.stream_position(client.ws)
+                    writes = client.__dict__.get("trace_writes") or deque()
+                    while writes and writes[0][0] <= acked:
+                        writes.popleft()  # acknowledged
+                    age = now - writes[0][1] if writes else 0.0
                     writer.writerow([f"{now:.4f}", client.client_id, acked, window, wscale,
                                      written if written is not None else "", client.frames_sent,
-                                     client.mode])
+                                     client.mode, f"{age:.4f}"])
             await asyncio.sleep(args.interval)
 
     async def main() -> None:
@@ -81,7 +104,7 @@ def run(args) -> None:
         with open(samples_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["t", "client_id", "acked", "window", "wscale", "written",
-                             "frames", "mode"])
+                             "frames", "mode", "unacked_age"])
             sampler = asyncio.create_task(sample(writer, stop))
             await asyncio.sleep(1.0)
             source = await asyncio.create_subprocess_exec(
@@ -97,7 +120,64 @@ def run(args) -> None:
     print(f"samples in {samples_path}, client log in {clients_path}")
 
 
-def analyse(args) -> None:
+def percentile(values: list[float], q: float) -> float:
+    if not values:
+        return float("nan")
+    values = sorted(values)
+    return values[min(len(values) - 1, int(q * len(values)))]
+
+
+def age_stats(out: str) -> dict:
+    """Per client group: oldest-unacknowledged ages (s) over all samples, and
+    message latencies (ms) as the clients saw them."""
+    slow, latency = set(), defaultdict(list)
+    with open(os.path.join(out, "clients.csv"), newline="") as f:
+        for row in csv.DictReader(f):
+            group = "slow" if row["slow"] == "1" else "normal"
+            if row["slow"] == "1":
+                slow.add(row["client_id"])
+            if row["event_type"] == "CAPTION_UPDATE" and row["latency_ms"]:
+                latency[group].append(float(row["latency_ms"]))
+    ages, over = defaultdict(list), defaultdict(set)
+    with open(os.path.join(out, "samples.csv"), newline="") as f:
+        for row in csv.DictReader(f):
+            group = "slow" if row["client_id"] in slow else "normal"
+            age = float(row["unacked_age"])
+            ages[group].append(age)
+            if age > 0.4:
+                over[group].add(row["client_id"])
+    return {g: {"ages": ages[g], "latency": latency[g], "clients_over": len(over[g])}
+            for g in ages}
+
+
+def describe_ages(stats: dict) -> str:
+    a = stats["ages"]
+    share = "  ".join(f">{d * 1000:.0f}ms {100 * sum(x > d for x in a) / len(a):6.3f}%" for d in LIMITS)
+    return (f"age P50 {1000 * percentile(a, .5):5.0f}  P99 {1000 * percentile(a, .99):5.0f}  "
+            f"P99.9 {1000 * percentile(a, .999):5.0f}  max {1000 * max(a):6.0f} ms | {share} | "
+            f"clients ever >400ms {stats['clients_over']:3} | "
+            f"latency P95 {percentile(stats['latency'], .95):5.0f} ms")
+
+
+def ages(args) -> None:
+    for group, stats in sorted(age_stats(args.out).items()):
+        print(f"{group:6} ({len(stats['ages'])} samples): {describe_ages(stats)}")
+
+
+def summary(args) -> None:
+    width = max(len(os.path.basename(os.path.normpath(d))) for d in args.dirs)
+    for d in args.dirs:
+        name = os.path.basename(os.path.normpath(d))
+        try:
+            stats = age_stats(d)
+        except FileNotFoundError:
+            print(f"{name:{width}}  (no trace)")
+            continue
+        for group, s in sorted(stats.items()):
+            print(f"{name:{width}} {group:6} {describe_ages(s)}")
+
+
+def window(args) -> None:
     slow, reads = set(), defaultdict(list)
     with open(os.path.join(args.out, "clients.csv"), newline="") as f:
         for row in csv.DictReader(f):
@@ -196,13 +276,17 @@ def main() -> None:
     r.add_argument("--interval", type=float, default=0.05)
     r.add_argument("--server-env", action="append", default=[],
                    help="KEY=VALUE for the server, e.g. LIVERECALL_BACKPRESSURE=0")
-    a = sub.add_parser("analyse")
-    a.add_argument("out")
-    a.add_argument("--span", type=float, default=1.0)
-    a.add_argument("--min-bytes", type=int, default=300)
-    a.add_argument("--stall-ratio", type=float, default=0.1)
+    w = sub.add_parser("window")
+    w.add_argument("out")
+    w.add_argument("--span", type=float, default=1.0)
+    w.add_argument("--min-bytes", type=int, default=300)
+    w.add_argument("--stall-ratio", type=float, default=0.1)
+    g = sub.add_parser("ages")
+    g.add_argument("out")
+    s = sub.add_parser("summary")
+    s.add_argument("dirs", nargs="+")
     args = p.parse_args()
-    run(args) if args.cmd == "run" else analyse(args)
+    {"run": run, "window": window, "ages": ages, "summary": summary}[args.cmd](args)
 
 
 if __name__ == "__main__":
