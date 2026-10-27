@@ -13,6 +13,8 @@ const SERVER_HISTORY_SECONDS = 60;
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
 const recallEl = document.getElementById("recall");
+const disconnectButton = document.getElementById("disconnect");
+const resetButton = document.getElementById("reset");
 
 // Each value stores the latest caption fields plus the row used to display it.
 const CAPTIONS_STATE = new Map();
@@ -23,6 +25,8 @@ let recallWindowSeconds = 30;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
 let ws;
+
+disconnectButton.disabled = true;
 
 function numericClientId() {
   const key = "liverecall-client-id";
@@ -140,6 +144,13 @@ function handleServerMessage(event) {
       console.error("Ignoring invalid HISTORY message: items must be an array", msg);
       return;
     }
+    if (msg.items.length > 0) {
+        console.log(`Last segment of client is ${lastSegment} with final = ${CAPTIONS_STATE.get(lastSegment)?.final}.`);
+        console.log(`oldest segment received is ${msg.items[0].segment}.`);
+        console.log(`Oldest caption age in History is ${Number((Date.now() / 1000) - msg.items[0]?.source_ts)} seconds`);
+        console.log(`History size is ${msg.items.length} with segments ${msg.items[0].segment} to ${msg.items[msg.items.length - 1].segment}.`);
+    }
+
     for (const caption of msg.items) {
       // HISTORY is reserved for finalized captions.
       if (caption?.final === true) upsertCaption(caption);
@@ -156,6 +167,8 @@ function connect() {
 
   ws.addEventListener("open", () => {
     statusEl.textContent = "connected";
+    console.log("Client connected.")
+    disconnectButton.disabled = false;
     reconnectAttempt = 0;
     ws.send(JSON.stringify({
       type: "CLIENT_HELLO",
@@ -171,9 +184,10 @@ function connect() {
 
   ws.addEventListener("close", () => {
     statusEl.textContent = "disconnected";
+    disconnectButton.disabled = true;
     if (reconnectTimer !== null) return;
 
-    const delay = Math.min(1000 * 2 ** reconnectAttempt, 30000);
+    const delay = Math.min(3000 * 2 ** reconnectAttempt, 30000);
     reconnectAttempt += 1;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
@@ -186,12 +200,37 @@ function connect() {
   });
 }
 
+
 for (const button of document.querySelectorAll("button[data-seconds]")) {
   button.addEventListener("click", () => {
     recallWindowSeconds = Number(button.dataset.seconds);
     renderRecall();
   });
 }
+
+disconnectButton.addEventListener("click", () => {
+  if (ws?.readyState === WebSocket.OPEN) {
+    disconnectButton.disabled = true;
+    statusEl.textContent = "Simulating disconnect";
+    console.log("Client disconnect simulated.");
+    ws.close(4000, "Disconnect test requested");
+  }
+});
+
+resetButton.addEventListener("click", () => {
+  CAPTIONS_STATE.clear();
+  liveEl.replaceChildren();
+  lastSegment = 0;
+  lastRevision = 0;
+  renderRecall();
+
+  if (ws?.readyState === WebSocket.OPEN) {
+    statusEl.textContent = "resetting";
+    ws.close(1000, "Client state reset");
+  }
+
+  console.log("Client state cleared; reconnecting for recent history.");
+});
 
 // Expire old finalized rows even when no new captions are arriving.
 setInterval(() => {

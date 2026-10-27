@@ -18,7 +18,12 @@
 </head>
 <body>
   <h1>LiveRecall</h1>
-  <p>Connection: <span id="status">disconnected</span></p>
+  <div>
+    <p style="display:inline-block;">Connection: <span id="status">disconnected</span></p>
+    <button id="disconnect" type="button">Simulate disconnect</button>
+    <button id="reset" type="button">Reset client</button>
+  </div>
+
   <p class="hint">Each segment keeps one row. Provisional revisions update it until the final caption arrives.</p>
   <div id="live"></div>
   <div>
