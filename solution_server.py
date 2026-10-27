@@ -77,10 +77,24 @@ opened while the link was already congested never sees its own base RTT. A
 client much farther away than the others would look congested and simply not
 be probed.
 
+Lean delivery on an overloaded link: when a message sent to a client is still
+unacknowledged after 1 s, that client's share of the link cannot carry the
+caption stream, and everything handed to TCP queues behind it (lost segments
+hold up all later ones). The client then gets one message in flight at a
+time: the next is written only once TCP has acknowledged the previous one,
+and meanwhile newer revisions replace the unsent older revisions of the same
+segment (finals are never dropped; waiting finals can leave as one catch-up
+HISTORY). What is sent is therefore current, and fewer bytes compete for the
+link. The one-in-flight rule applies only while TCP's smoothed RTT is at
+least 50 ms, so a lean client whose link recovers gets every revision again
+at once; it returns to normal delivery once nothing has stayed
+unacknowledged for more than 0.25 s for 10 s. Lean clients are not probed.
+
 Experiment switches (environment variables, inherited by run_demo.py):
     LIVERECALL_BACKPRESSURE=0     no lag probes: always FULL
     LIVERECALL_PACING=0           HOLD/coalescing only, never PACED
     LIVERECALL_CATCHUP_HISTORY=0  never batch finals into a catch-up HISTORY
+    LIVERECALL_LEAN=0             never switch a client to lean delivery
 """
 
 from __future__ import annotations
@@ -192,6 +206,15 @@ PACE_BURST = 2.0             # token bucket depth; a provisional needs a spare
 PACED_RETRY_SECONDS = 60.0   # stall-free this long: try full rate again
 PACED_RETRY_MAX = 600.0
 
+# Lean delivery on an overloaded link (one message in flight, coalescing).
+LEAN_ENTER_AGE = 1.0         # a message unacknowledged this long: go lean
+LEAN_EXIT_AGE = 0.25         # back to normal once no message stayed unacknowledged
+LEAN_EXIT_SECONDS = 10.0     # longer than LEAN_EXIT_AGE for this long
+LINK_TICK = 0.05             # how often waiting lean clients are checked for an ACK
+LEAN_GATE_RTT = 0.05         # one message in flight only if TCP's RTT is at least this
+LINK_CHECK_INTERVAL = 0.25   # how often every client's oldest unacknowledged message is checked
+UNACKED_WRITES = 1024        # write positions remembered per client
+
 # Outbox bounds.
 MAX_PENDING = 512                      # entries before forced coalescing
 MAX_PENDING_AGE = HISTORY_MAX_SECONDS  # oldest unsent caption older: disconnect
@@ -203,6 +226,7 @@ REPORT_HELD_MAX = 10
 BACKPRESSURE = env_flag("LIVERECALL_BACKPRESSURE", True)
 PACING = env_flag("LIVERECALL_PACING", True)
 CATCHUP_HISTORY = env_flag("LIVERECALL_CATCHUP_HISTORY", True)
+LEAN = env_flag("LIVERECALL_LEAN", True)
 CATCHUP_MIN_FINALS = 2
 CATCHUP_MAX_FINALS = 200
 
@@ -211,6 +235,7 @@ FULL, HOLD, PACED = "full", "hold", "paced"
 DEFAULT_SESSION = "L1"
 SESSIONS: dict[str, SessionState] = {}
 BASE_RTT_US = math.inf  # lowest minimum RTT of any client connection (link_queueing)
+GATED: set[ClientSession] = set()  # lean clients waiting for their last message's ACK
 BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 
@@ -369,8 +394,12 @@ class ClientSession:
         self.pending: OrderedDict[int, deque[Caption]] = OrderedDict()
         self.n_pending = 0
         self.preamble: deque[str] = deque()  # HISTORY reply, sent before anything else
-        self.catching_up = False             # backlog left over from a HOLD
+        self.catching_up = False             # backlog left over from a HOLD or lean delivery
         self.catchup_allowed = False         # may receive catch-up HISTORY messages
+        self.lean = False                    # one message in flight, coalescing
+        self.lean_calm_since: float | None = None
+        # (stream position after each write, write time) not yet acknowledged
+        self.unacked_writes: deque[tuple[int, float]] = deque(maxlen=UNACKED_WRITES)
 
         self.mode = FULL
         self.mode_before_hold = FULL
@@ -420,10 +449,12 @@ class ClientSession:
         if self.closing:
             return
         queue = self.pending.get(caption.segment)
+        if self.lean:
+            self.catching_up = True  # waiting finals may leave as one HISTORY
         if queue is None:
             self.pending[caption.segment] = deque((caption,))
             self.n_pending += 1
-        elif self.mode == FULL:
+        elif self.mode == FULL and not self.lean:
             queue.append(caption)
             self.n_pending += 1
         else:
@@ -567,8 +598,49 @@ class ClientSession:
             ready_at = now + (need - self.tokens) / rate
             deadline = ready_at if deadline is None else min(deadline, ready_at)
         elif self.n_pending:
+            if self.lean and self.slow_path() and self.in_flight():
+                GATED.add(self)  # watch_links() wakes us once it is acknowledged
+                return None if deadline is None else max(deadline - now, 0.001)
+            GATED.discard(self)
             return 0.0
         return None if deadline is None else max(deadline - now, 0.001)
+
+    def in_flight(self) -> bool:
+        """Is anything we wrote still unacknowledged by the client's TCP?"""
+        return bool(unacked_bytes(self.ws))
+
+    def slow_path(self) -> bool:
+        """TCP's smoothed RTT is at least LEAN_GATE_RTT. On a faster path,
+        waiting for each ACK (checked every LINK_TICK) would only add delay."""
+        rtt = tcp_info_field(tcp_info(self.ws), TCPI_RTT, "<I")
+        return rtt is None or rtt >= LEAN_GATE_RTT * 1e6
+
+    def check_link(self, now: float) -> None:
+        """Track the oldest unacknowledged message. Go lean when it is older
+        than LEAN_ENTER_AGE; go back once no message has stayed unacknowledged
+        longer than LEAN_EXIT_AGE for LEAN_EXIT_SECONDS."""
+        acked = tcp_info_field(tcp_info(self.ws), TCPI_BYTES_ACKED, "<Q")
+        if acked is None:
+            return
+        writes = self.unacked_writes
+        while writes and writes[0][0] <= acked:
+            writes.popleft()
+        age = now - writes[0][1] if writes else 0.0
+        if not self.lean:
+            if age > LEAN_ENTER_AGE:
+                self.lean = True
+                self.lean_calm_since = None
+                print(f"client {self.client_id}: a message unacknowledged for {age:.1f}s; "
+                      "lean delivery (one message in flight)", flush=True)
+        elif age > LEAN_EXIT_AGE:
+            self.lean_calm_since = None
+        elif self.lean_calm_since is None:
+            self.lean_calm_since = now
+        elif now - self.lean_calm_since >= LEAN_EXIT_SECONDS:
+            self.lean = False
+            self.wake.set()
+            print(f"client {self.client_id}: link keeping up for {LEAN_EXIT_SECONDS:.0f}s; "
+                  "normal delivery", flush=True)
 
     async def send_next(self) -> None:
         batch = []
@@ -601,6 +673,10 @@ class ClientSession:
         self.frames_sent += 1
         self.last_write_at = self.loop.time()
         self.write_times.append(self.last_write_at)
+        if LEAN:
+            end = stream_position(self.ws)
+            if end is not None:
+                self.unacked_writes.append((end, self.last_write_at))
 
     def send_rate(self, until: float) -> float:
         """Messages per second written to this client in the SEND_RATE_WINDOW
@@ -628,7 +704,7 @@ class ClientSession:
 
     def probe_due(self, now: float) -> bool:
         """Should the message about to be written carry a lag probe?"""
-        if not BACKPRESSURE or self.probe_sent_at is not None:
+        if not BACKPRESSURE or self.probe_sent_at is not None or self.lean:
             return False
         since = now - self.last_probe_at
         backoff = self.probe_backoff
@@ -749,7 +825,7 @@ class ClientSession:
         if self.mode == HOLD:
             state += (f" for {now - self.hold_onset:.1f}s, confirmations={self.confirms}, "
                       f"all_acked={self.acked_since is not None}, client_reading={self.client_reading}")
-        state += (f", pending={self.n_pending}, written={self.frames_sent}, "
+        state += (f", lean={self.lean}, pending={self.n_pending}, written={self.frames_sent}, "
                   f"last write {now - self.last_write_at:.1f}s ago, probe_backoff={self.probe_backoff:g}")
         return f"{state}; tcp: {tcp_report(self.ws)}"
 
@@ -1069,6 +1145,7 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
         pass
     finally:
         session.clients.discard(client)
+        GATED.discard(client)
         client.closing = True
         sender.cancel()
         try:
@@ -1116,9 +1193,11 @@ def report_stats() -> None:
     backed_off = sum(client.probe_backoff > 1 for client in clients)
     queueing = sum(client.queueing for client in clients)
     base = f"{BASE_RTT_US / 1000:.3f}ms" if BASE_RTT_US != math.inf else "none"
+    lean = sum(client.lean for client in clients)
     print(f"stats: clients={len(clients)} full={modes[FULL]} hold={modes[HOLD]} "
           f"paced={modes[PACED]} queued={queued} history_finals={history} "
-          f"probe_backoff={backed_off} queueing={queueing} base_rtt={base}", flush=True)
+          f"probe_backoff={backed_off} queueing={queueing} base_rtt={base} "
+          f"lean={lean} waiting_for_ack={len(GATED)}", flush=True)
     now = asyncio.get_running_loop().time()
     held = sorted((client for client in clients
                    if client.mode == HOLD and now - client.hold_onset > REPORT_HELD_AFTER),
@@ -1141,6 +1220,27 @@ async def housekeeping() -> None:
         if now >= next_report:
             next_report = now + STATS_INTERVAL
             report_stats()
+
+
+async def watch_links() -> None:
+    """Wake lean clients whose last message has been acknowledged, and check
+    every client's oldest unacknowledged message every LINK_CHECK_INTERVAL.
+    One task polls the kernel for all clients (asyncio has no event for an
+    incoming ACK)."""
+    loop = asyncio.get_running_loop()
+    next_check = loop.time()
+    while True:
+        await asyncio.sleep(LINK_TICK)
+        for client in list(GATED):
+            if client.closing or not client.in_flight():
+                GATED.discard(client)
+                client.wake.set()
+        now = loop.time()
+        if now >= next_check:
+            next_check = now + LINK_CHECK_INTERVAL
+            for session in list(SESSIONS.values()):
+                for client in list(session.clients):
+                    client.check_link(now)
 
 
 class PortCheckFilter(logging.Filter):
@@ -1178,9 +1278,11 @@ async def main_async(port: int) -> None:
         ping_timeout=60,
     ):
         spawn(housekeeping())
+        if LEAN:
+            spawn(watch_links())
         print(f"LiveRecall server listening on ws://0.0.0.0:{port} "
               f"(backpressure={BACKPRESSURE}, pacing={PACING}, "
-              f"catchup_history={CATCHUP_HISTORY})", flush=True)
+              f"catchup_history={CATCHUP_HISTORY}, lean={LEAN})", flush=True)
         await asyncio.Future()
 
 
