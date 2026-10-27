@@ -15,88 +15,71 @@ Data path
         one sender task per student connection drains that client's own
         bounded outbox, so a slow client can only delay itself
 
+Delivery: where a caption can wait
+-----------------------------------
+On its way to a student, a caption passes three places:
+
+    outbox  ->  socket and network  ->  client kernel and library  ->  app
+    (ours)      (TCP has it)            (delivered, not yet read)
+
+Only in the outbox can a waiting revision still be replaced by a newer one
+of the same segment. So the server keeps a backlog in the outbox and releases
+messages only as fast as the later stages drain them. Finals are never
+dropped: a final is the newest revision of its segment. When nothing is
+backlogged every revision goes out at once, so clients that keep up get the
+full revision stream; revisions are replaced only while the client is being
+held back.
+
+The two later stages report back in different ways, so each has its own
+control loop.
+
+Loop 1, the network (ACKs). TCP reports which bytes the client's kernel has
+acknowledged. How long our oldest unacknowledged message has been waiting is
+how far the path is behind: a few ms on loopback, about one round trip on a
+long path, much more on an overloaded link or while a lost packet is being
+repaired (nothing behind the gap can be delivered meanwhile). While it is
+above NETWORK_LAG_LIMIT (0.4 s, just under the 500 ms freshness threshold),
+provisional revisions stay in the outbox; finals are always written.
+
+Loop 2, the application (pongs). A websockets client reads ahead into a
+16-message queue whatever its application is doing, stops reading the socket
+above 16 and resumes at 4. Its kernel keeps acknowledging data, so loop 1
+cannot see a slow reader, and its receive window stays open (128 KB buffers
+for ~42-byte compressed messages). The one application-level signal is the
+pong: the library answers a ping only when it reads it. So every 8th message
+(half the library queue) carries a ping. When the client's TCP has
+acknowledged a ping but no pong has come back within PONG_GRACE, the library
+has stopped reading: the client is held (nothing is written). When the pong
+arrives, the stall length gives the reading rate (the library resumes after
+the application has read 12 messages); a client that reads slower than we
+were sending is then paced just below that rate, finals first.
+
+A pong can also be lost on the way back; TCP then repairs it only on a
+growing timeout, because the client has nothing else to send. A held client
+is therefore pinged again every CONFIRM_INTERVAL: a client that reads
+answers, its answers arrive behind the lost one (the kernel counts the
+segment but cannot deliver it yet), and the hold ends at once. Those answers
+also make the client's TCP resend the lost one immediately.
+
 Delivery modes (per client)
 ---------------------------
-    FULL   normal operation: every accepted revision is forwarded in order.
-    HOLD   a lag probe reached the client's TCP but its application has not
-           answered it, so the client may have stopped reading. Nothing is
-           written; a newer revision replaces the unsent older revisions of
-           the same segment. Finals are never dropped.
-    PACED  the client application reads slower than the caption stream. Its
-           messages are rate-limited to just below its measured reading rate,
-           finals first, so few (and only current) messages wait in its
-           receive buffer.
+    FULL   normal operation, subject to loop 1.
+    HOLD   the library stopped reading (loop 2): nothing is written; newer
+           revisions replace unsent older ones.
+    PACED  a slow reader: rate-limited to its measured reading rate, finals
+           first, still subject to loop 1.
 
-Catch-up: when a lagging client has two or more unsent finals, they are sent
+Catch-up: when a held-back client has two or more unsent finals, they leave
 together as one HISTORY message (finals only, oldest first, none the client
 already holds), so a slow reader spends one read on them instead of one per
 final. Only clients that joined with nothing to recover get this; a resumed
 or late-joining connection keeps exactly one HISTORY, its recovery reply.
 
-Lag probes: after writing data the sender sends a WebSocket ping. The client
-answers only once it has read everything sent before the ping. A websockets
-client keeps reading until 16 unread messages are queued and then stops
-reading from TCP until its application has worked the queue down to 4, so an
-overdue pong is the earliest sign of a slow reader. Server-side send buffers
-stay empty in that case because the client's kernel keeps accepting data.
-
-A late pong only starts a HOLD once the kernel reports that the client's TCP
-has acknowledged the ping (or closed its receive window): the ping arrived
-and the application did not answer. A ping still on its way, behind a
-congested link or a lost segment, is network delay; holding the client back
-would only add to it, so the client stays in its mode.
-
-The pong itself can be lost too, and TCP then waits longer and longer before
-resending it, because the client has nothing else to send. So a held client
-is pinged again every 0.5 s. A client that is not reading cannot answer; one
-that is reading does, and its answers arrive out of order behind the lost one
-(the kernel counts the segment but cannot deliver it). That ends the hold at
-once, with no new hold until the lost data arrives, and the out-of-order
-arrival makes the client's TCP resend the lost reply right away. A hold only
-turns into pacing if every byte was acknowledged, the client sent us nothing
-in the meantime and the reading rate the stall implies is clearly below the
-rate we were sending. Otherwise the pong was held up in the network and the
-client goes back to its previous mode.
-
-A pong that does not ride on the client's ACK costs a packet, which matters
-on a constrained link. Clients with no lag in the last 30 s are therefore
-probed once a second (or every 8 messages, if sooner); lagging or paced
-clients are probed with every message, at most every 0.25 s. Each time a ping
-is found still on its way, that client's probe intervals double (up to 8x),
-so probing backs off on a congested link; a prompt answer halves them again.
-
-No probes at all while the path queues: when TCP's smoothed RTT is more than
-0.2 s above the base RTT, the client is not probed until it is back within
-0.1 s. On an overloaded link the pongs compete with captions and get lost, and
-under heavy local drops Linux was seen to abort such two-way connections with
-ETIMEDOUT within seconds, without the client noticing. A slow reader on a
-congested path is then handled like any other client. The base RTT is the
-lowest minimum RTT of any client connection: clients share the path to the
-server (one classroom network, or loopback in the tests), and a connection
-opened while the link was already congested never sees its own base RTT. A
-client much farther away than the others would look congested and simply not
-be probed.
-
-Lean delivery on an overloaded link: when a message sent to a client is still
-unacknowledged after 1 s and the path is queueing (TCP's RTT more than 0.4 s
-above the base RTT), that client's share of the link cannot carry the
-caption stream, and everything handed to TCP queues behind it (lost segments
-hold up all later ones). A late message on a path that is not queueing (a
-single loss being repaired) does not count. The client then gets at most one provisional
-revision in flight: the next is written only once TCP has acknowledged what
-was sent, and meanwhile newer revisions replace the unsent older revisions
-of the same segment. Finals never wait: they are written at once (waiting
-finals as one catch-up HISTORY). What is sent is therefore current, and
-fewer bytes compete for the link. The wait applies only while TCP's smoothed
-RTT is at least 50 ms, so a lean client whose link recovers gets every
-revision again at once; it returns to normal delivery once queueing has
-stayed under 0.2 s for 10 s. Lean clients are not probed.
-
 Experiment switches (environment variables, inherited by run_demo.py):
-    LIVERECALL_BACKPRESSURE=0     no lag probes: always FULL
-    LIVERECALL_PACING=0           HOLD/coalescing only, never PACED
+    LIVERECALL_BACKPRESSURE=0     no pings: loop 2 off, always FULL
+    LIVERECALL_PACING=0           holds, but never PACED
+    LIVERECALL_NETWORK_GATE=0     loop 1 off
     LIVERECALL_CATCHUP_HISTORY=0  never batch finals into a catch-up HISTORY
-    LIVERECALL_LEAN=0             never switch a client to lean delivery
 """
 
 from __future__ import annotations
@@ -131,8 +114,6 @@ TCPI_BYTES_ACKED = 120
 TCPI_BYTES_RECEIVED = 128
 TCPI_DATA_SEGS_IN = 152
 TCPI_SND_WND = 228
-TCPI_RTT = 68                # smoothed RTT, microseconds
-TCPI_MIN_RTT = 148           # minimum RTT seen, microseconds
 # Diagnostics only (stuck-client reports): name -> (offset, format)
 TCPI_REPORT = {
     "retransmits": (2, "<B"), "backoff": (4, "<B"), "rto_ms": (8, "<I"),
@@ -157,66 +138,41 @@ HISTORY_MAX_FINALS = 5000         # hard cap for an extremely bursty source
 HISTORY_CHUNK_BYTES = 256 * 1024  # split replies well below the 1 MiB frame limit
 DEFAULT_HISTORY_SECONDS = 30.0
 
-# Lag detection.
-PROBE_INTERVAL = 0.25        # at most one lag probe per 0.25 s, only after data.
-                             # The ping shares the caption's TCP segment (corked);
-                             # the pong rides on the client's ACK only if the
-                             # client answers at once, otherwise it is a packet
-HEALTHY_PROBE_INTERVAL = 1.0 # no recent lag: a probe per second...
-HEALTHY_PROBE_FRAMES = 8     # ...or after 8 unprobed messages, if sooner
-WATCH_SECONDS = 30.0         # lagged this recently: probe every PROBE_INTERVAL
-PROBE_BACKOFF_MAX = 8.0      # a ping still in the network when checked doubles
-                             # the client's probe intervals (up to 8x); a prompt
-                             # answer halves them again
-QUEUEING_STOP = 0.2          # no probes while TCP's RTT is this far above the
-QUEUEING_RESUME = 0.1        # base RTT, until it is back under this
-LAG_MARGIN = 0.25            # a probe is overdue after min RTT + LAG_MARGIN...
-DELIVERY_GRACE = LAG_MARGIN / 2  # ...and once the client's TCP has acknowledged
-                                 # the ping this long ago (the pong may trail
-                                 # the ACK by jitter or a busy client)
-INITIAL_RTT = 0.25           # RTT assumed before the first sample
-RTT_SAMPLES = 32             # min-RTT window
-HOLD_SAMPLE_INTERVAL = 0.1   # kernel send-queue check period while held
-CONFIRM_INTERVAL = 0.5       # while held, ping again this often. A client that
-                             # is reading answers; arriving behind a lost reply,
-                             # the answers show that and make its TCP resend the
-                             # lost one at once instead of after a backed-off
-                             # retransmission timeout
-RECEIVER_CONFIRM = 0.5       # pong still missing this long after the kernel
-                             # reported every byte acknowledged: the client
-                             # application is not reading
-MIN_RECEIVER_STALL = 1.0
-ONSET_LOOKBACK = 1.0         # a stall cannot have begun earlier than this
-                             # before the overdue probe
-# A reader can only fall 16 messages behind if it reads clearly slower than
-# we send to it. A stall implying a reading rate above this fraction of our
-# recent sending rate was the network instead (e.g. a lost pong being
-# retransmitted while our data was still acknowledged).
-READER_RATE_RATIO = 0.7
-SEND_RATE_WINDOW = 10.0      # seconds of writes used for the sending rate
+# Loop 1, network: how far the path to a client may fall behind before
+# provisional revisions stay in the outbox. Just under the 500 ms freshness
+# threshold; on unloaded paths (loopback, 100 ms delay, jitter, reordering)
+# the oldest unacknowledged message was never this old (experiments/
+# run_trace_suite.sh).
+NETWORK_LAG_LIMIT = 0.4
+LINK_TICK = 0.05             # asyncio has no event for an incoming ACK: clients
+                             # waiting on loop 1 are checked this often
+UNACKED_WRITES = 1024        # write positions remembered per client
 
-# Pacing slow readers. A websockets client stops reading from TCP above 16
-# queued messages and resumes once its application has read the queue down
-# to 4: during a stall it reads 13 messages, the first of which was already
-# being read, so the stall lasts about 12 full read intervals.
+# Loop 2, application. The websockets client library reads ahead until
+# LIBRARY_QUEUE messages are waiting for its application, then stops reading
+# the socket until the application has worked the queue down to
+# LIBRARY_RESUME. During a stall it reads LIBRARY_QUEUE + 1 - LIBRARY_RESUME
+# messages, the first already being read: the stall lasts DRAIN_FRAMES reads.
+LIBRARY_QUEUE = 16
+LIBRARY_RESUME = 4
+DRAIN_FRAMES = LIBRARY_QUEUE - LIBRARY_RESUME
+PROBE_EVERY = LIBRARY_QUEUE // 2  # a ping on every 8th message: a stall is seen
+                                  # within 8 messages, at one pong per 8
+PONG_GRACE = 0.25            # pong still missing this long after the client's TCP
+                             # acknowledged the ping: the library is not reading
+                             # (allows for a busy client process)
+PROBE_CHECK = 0.1            # how often an unanswered ping is re-examined
+CONFIRM_INTERVAL = 0.5       # while held, ping again this often (lost pongs)
+SEND_RATE_WINDOW = 10.0      # seconds of writes used for the sending rate
+LOG_STALL = 1.0              # stalls shorter than this are not logged
+
+# Pacing slow readers.
 PACING_FRACTION = 0.85       # steady state: 85% of the measured reading rate
-DRAIN_FRAMES = 12
-RESUME_QUEUE = 4             # messages still queued at the client when it resumes
 MIN_PACE_RATE = 0.2          # messages per second
 PACE_BURST = 2.0             # token bucket depth; a provisional needs a spare
                              # token so the next final is not delayed by it
 PACED_RETRY_SECONDS = 60.0   # stall-free this long: try full rate again
 PACED_RETRY_MAX = 600.0
-
-# Lean delivery on an overloaded link (one message in flight, coalescing).
-LEAN_ENTER_AGE = 1.0         # a message unacknowledged this long...
-LEAN_QUEUEING = 0.4          # ...while TCP's RTT is this far above the base RTT: go lean
-                             # (jitter plus a lost packet reached ~0.36 s; overload ~0.7 s)
-LEAN_EXIT_SECONDS = 10.0     # queueing under QUEUEING_STOP this long: back to normal
-LINK_TICK = 0.05             # how often waiting lean clients are checked for an ACK
-LEAN_GATE_RTT = 0.05         # one message in flight only if TCP's RTT is at least this
-LINK_CHECK_INTERVAL = 0.25   # how often every client's oldest unacknowledged message is checked
-UNACKED_WRITES = 1024        # write positions remembered per client
 
 # Outbox bounds.
 MAX_PENDING = 512                      # entries before forced coalescing
@@ -228,8 +184,8 @@ REPORT_HELD_MAX = 10
 
 BACKPRESSURE = env_flag("LIVERECALL_BACKPRESSURE", True)
 PACING = env_flag("LIVERECALL_PACING", True)
+NETWORK_GATE = env_flag("LIVERECALL_NETWORK_GATE", True)
 CATCHUP_HISTORY = env_flag("LIVERECALL_CATCHUP_HISTORY", True)
-LEAN = env_flag("LIVERECALL_LEAN", True)
 CATCHUP_MIN_FINALS = 2
 CATCHUP_MAX_FINALS = 200
 
@@ -237,8 +193,7 @@ FULL, HOLD, PACED = "full", "hold", "paced"
 
 DEFAULT_SESSION = "L1"
 SESSIONS: dict[str, SessionState] = {}
-BASE_RTT_US = math.inf  # lowest minimum RTT of any client connection (link_queueing)
-GATED: set[ClientSession] = set()  # lean clients waiting for their last message's ACK
+WAITING: set[ClientSession] = set()  # clients waiting on loop 1 for an ACK
 BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 
@@ -381,8 +336,241 @@ class SessionState:
                       key=lambda c: c.segment)
 
 
+class Outbox:
+    """A client's unsent captions: segment -> unsent revisions, oldest first.
+    Segments leave in insertion order, i.e. segment order."""
+
+    def __init__(self) -> None:
+        self.pending: OrderedDict[int, deque[Caption]] = OrderedDict()
+        self.count = 0
+
+    def __bool__(self) -> bool:
+        return self.count > 0
+
+    def add(self, caption: Caption, replace: bool) -> None:
+        """Queue a revision. With `replace` it supersedes the unsent older
+        revisions of its segment; a final is always the newest revision."""
+        queue = self.pending.get(caption.segment)
+        if queue is None:
+            self.pending[caption.segment] = deque((caption,))
+            self.count += 1
+        elif replace:
+            self.count += 1 - len(queue)
+            queue.clear()
+            queue.append(caption)
+        else:
+            queue.append(caption)
+            self.count += 1
+
+    def compact(self) -> None:
+        """Keep only the newest unsent revision of every segment."""
+        for queue in self.pending.values():
+            if len(queue) > 1:
+                newest = queue[-1]
+                queue.clear()
+                queue.append(newest)
+        self.count = len(self.pending)
+
+    def head(self) -> Caption:
+        return next(iter(self.pending.values()))[0]
+
+    def pop(self) -> Caption:
+        segment, queue = next(iter(self.pending.items()))
+        caption = queue.popleft()
+        self.count -= 1
+        if not queue:
+            del self.pending[segment]
+        return caption
+
+    def leading_finals(self, limit: int) -> list[Caption]:
+        """Unsent finals at the front (candidates for one HISTORY)."""
+        batch = []
+        for queue in self.pending.values():
+            if not queue[0].final:
+                break
+            batch.append(queue[0])
+            if len(batch) >= limit:
+                break
+        return batch
+
+    def clear(self) -> None:
+        self.pending.clear()
+        self.count = 0
+
+
+class NetworkGate:
+    """Loop 1: how far the network path to one client is behind, from the
+    bytes its TCP has acknowledged."""
+
+    def __init__(self, ws) -> None:
+        self.ws = ws
+        # (stream position just past a written message, write time), oldest
+        # first; entries leave once the client's TCP acknowledged them.
+        self.writes: deque[tuple[int, float]] = deque(maxlen=UNACKED_WRITES)
+        self.holding = False  # provisionals are being kept in the outbox
+
+    def wrote(self, now: float) -> None:
+        end = stream_position(self.ws)
+        if end is not None:
+            self.writes.append((end, now))
+
+    def lag(self, now: float) -> float:
+        """How long the oldest unacknowledged message has been waiting."""
+        writes = self.writes
+        if not writes:
+            return 0.0
+        if now - writes[0][1] <= NETWORK_LAG_LIMIT:
+            return now - writes[0][1]  # an upper bound, and already under the limit
+        acked = tcp_info_field(tcp_info(self.ws), TCPI_BYTES_ACKED, "<Q")
+        if acked is None:
+            return 0.0  # the platform cannot tell: loop 1 never holds
+        while writes and writes[0][0] <= acked:
+            writes.popleft()
+        return now - writes[0][1] if writes else 0.0
+
+    def behind(self, now: float) -> bool:
+        return NETWORK_GATE and self.lag(now) > NETWORK_LAG_LIMIT
+
+
+class ReaderMonitor:
+    """Loop 2's observations: pings on every PROBE_EVERY-th message, and
+    whether the client library answers them."""
+
+    def __init__(self, ws) -> None:
+        self.ws = ws
+        self.sent_at: float | None = None      # outstanding ping
+        self.end: int | None = None            # stream position just past it
+        self.delivered_at: float | None = None
+        self.frames_at_probe = 0
+        self.write_at_probe = 0.0
+        # The last ping answered: the library had read every message written
+        # before it.
+        self.confirmed_frames = 0
+        self.confirmed_write_at: float | None = None
+        # While held: confirmation pings and the client's incoming data.
+        self.confirm_needed = False
+        self.last_confirm_at = -math.inf
+        self.confirms = 0
+        self.hold_counters: tuple[int, int] | None = None
+        self.client_reading = False
+        # In-order bytes received from the client when its replies were found
+        # stuck behind a lost segment: no stall can be seen until more arrive.
+        self.reply_gap: int | None = None
+
+    def due(self, frames_sent: int) -> bool:
+        """Should the message about to be written carry a ping?"""
+        return (BACKPRESSURE and self.sent_at is None
+                and frames_sent + 1 - self.frames_at_probe >= PROBE_EVERY)
+
+    async def probe(self, now: float, frames_sent: int, write_at: float, on_pong) -> None:
+        self.sent_at = now
+        self.delivered_at = None
+        self.frames_at_probe = frames_sent
+        self.write_at_probe = write_at
+        waiter = await self.ws.ping()
+        self.end = stream_position(self.ws)
+        waiter.add_done_callback(lambda done, sent_at=now: on_pong(done, sent_at))
+
+    def delivered(self) -> bool:
+        """Has the client's TCP received the outstanding ping (or closed its
+        receive window)? True when the platform cannot tell."""
+        if self.reply_gap is not None:
+            counters = tcp_receive_counters(self.ws)
+            if counters is not None and counters[0] == self.reply_gap:
+                return False  # its answer would be stuck behind the lost reply
+            self.reply_gap = None
+        info = tcp_info(self.ws)
+        acked = tcp_info_field(info, TCPI_BYTES_ACKED, "<Q")
+        if self.end is None or acked is None:
+            return True
+        return acked >= self.end or tcp_info_field(info, TCPI_SND_WND, "<I") == 0
+
+    def check(self, now: float) -> tuple[bool, float | None]:
+        """(library stopped reading?, seconds until the next look)."""
+        if self.sent_at is None:
+            return False, None
+        if self.delivered_at is None:
+            if not self.delivered():
+                return False, PROBE_CHECK  # still on its way: network delay, not a stall
+            self.delivered_at = now
+        stall_at = self.delivered_at + PONG_GRACE
+        if now >= stall_at:
+            return True, None
+        return False, stall_at - now
+
+    def confirm(self) -> None:
+        """The outstanding ping was answered."""
+        self.sent_at = None
+        self.confirmed_frames = self.frames_at_probe
+        self.confirmed_write_at = self.write_at_probe
+
+    def hold_started(self) -> None:
+        self.hold_counters = tcp_receive_counters(self.ws)
+        self.client_reading = False
+        self.confirms = 0
+        self.confirm_needed = BACKPRESSURE  # the first confirmation ping
+
+    def watch(self, now: float) -> None:
+        """While held: a client that is not reading cannot answer pings, so it
+        sends nothing. A data segment the kernel cannot deliver yet
+        (data_segs_in rises, in-order bytes do not) is an answer stuck
+        behind a lost one: the client is reading."""
+        if self.client_reading or self.hold_counters is None:
+            return
+        current = tcp_receive_counters(self.ws)
+        if current is None:
+            return
+        delivered, segments = current
+        base_delivered, base_segments = self.hold_counters
+        if delivered != base_delivered:
+            self.hold_counters = current  # in-order data, e.g. a client keepalive ping
+        elif segments > base_segments:
+            self.client_reading = True
+
+    def release(self) -> None:
+        """Hold ended because the client is reading: forget the ping whose
+        answer was lost, and see no stall until the lost data arrives."""
+        counters = tcp_receive_counters(self.ws)
+        self.reply_gap = counters[0] if counters is not None else None
+        self.sent_at = None
+
+
+class Pacer:
+    """Rate limit for a slow reader: a token bucket at its reading rate."""
+
+    def __init__(self) -> None:
+        self.rate = 0.0
+        self.tokens = 0.0
+        self.tokens_at = 0.0
+        self.since = 0.0
+        self.retry_after = PACED_RETRY_SECONDS
+        self.retried = False
+
+    def start(self, rate: float, still_queued: int, now: float) -> None:
+        """Pace at `rate` messages/s, after the `still_queued` messages that
+        are waiting on the client's side have been read."""
+        self.rate = max(MIN_PACE_RATE, rate)
+        self.tokens = 1.0 - still_queued
+        self.tokens_at = now
+        self.since = now
+
+    def wait(self, now: float, final: bool, finals_waiting: bool) -> float:
+        """Seconds until the head message may be written (0: now). The full
+        reading rate while finals pile up, PACING_FRACTION of it otherwise; a
+        provisional needs a spare token so it does not delay the next final."""
+        rate = self.rate if finals_waiting else PACING_FRACTION * self.rate
+        self.tokens = min(PACE_BURST, self.tokens + (now - self.tokens_at) * rate)
+        self.tokens_at = now
+        need = 1.0 if final else PACE_BURST
+        return 0.0 if self.tokens >= need else (need - self.tokens) / rate
+
+    def spend(self) -> None:
+        self.tokens -= 1.0
+
+
 class ClientSession:
-    """One student connection with its own bounded outbox and sender task."""
+    """One student connection: its outbox, the two control loops, and the
+    sender task that drains the outbox."""
 
     def __init__(self, ws, client_id: Any, session: SessionState) -> None:
         self.ws = ws
@@ -392,124 +580,43 @@ class ClientSession:
         self.wake = asyncio.Event()
         self.closing = False
 
-        # Outbox: segment -> unsent revisions of that segment, oldest first.
-        # Segments leave in insertion order, i.e. segment order.
-        self.pending: OrderedDict[int, deque[Caption]] = OrderedDict()
-        self.n_pending = 0
+        self.outbox = Outbox()
+        self.gate = NetworkGate(ws)         # loop 1
+        self.reader = ReaderMonitor(ws)     # loop 2: observations
+        self.pacer = Pacer()                # loop 2: rate limit
         self.preamble: deque[str] = deque()  # HISTORY reply, sent before anything else
-        self.catching_up = False             # backlog left over from a HOLD or lean delivery
+        self.catching_up = False             # backlog left over from being held back
         self.catchup_allowed = False         # may receive catch-up HISTORY messages
-        self.lean = False                    # one message in flight, coalescing
-        self.lean_calm_since: float | None = None
-        # (stream position after each write, write time) not yet acknowledged
-        self.unacked_writes: deque[tuple[int, float]] = deque(maxlen=UNACKED_WRITES)
 
         self.mode = FULL
         self.mode_before_hold = FULL
         self.hold_onset = 0.0
-        self.acked_since: float | None = None
-        self.confirm_needed = False   # send a confirmation ping
-        self.confirms = 0             # confirmation pings sent in the current hold
-        self.last_confirm_at = -math.inf
-        # In-order bytes received from the client when its replies were found
-        # stuck behind a lost segment; no new hold until more arrive.
-        self.reply_gap: int | None = None
-        self.hold_counters: tuple[int, int] | None = None
-        self.client_reading = False   # out-of-order client data seen during the hold
-
-        self.probe_sent_at: float | None = None
-        self.probe_end: int | None = None    # stream position just past the ping
-        self.probe_delivered_at: float | None = None
-        self.probe_congested = False         # the ping was still in the network when checked
-        self.probe_backoff = 1.0
-        self.queueing = False                # path congested: no probes (link_queueing)
-        self.last_probe_at = -math.inf
-        self.lag_seen_at = -math.inf
-        self.rtts: deque[float] = deque(maxlen=RTT_SAMPLES)
-        self.rtt_min = INITIAL_RTT
         self.frames_sent = 0
-        self.frames_at_probe = 0
-        self.frames_confirmed = 0            # frames_at_probe of the last answered probe
         self.write_times: deque[float] = deque(maxlen=256)
         self.last_write_at = 0.0
-        self.probe_last_write = 0.0
-        # Latest message the client confirmed reading (its pong came back in
-        # time). It may itself have filled the client's queue: the ping that
-        # followed it in the same TCP segment is still answered.
-        self.confirmed_write_at: float | None = None
-
-        self.reading_rate = 0.0
-        self.tokens = 0.0
-        self.tokens_at = 0.0
-        self.paced_since = 0.0
-        self.retry_after = PACED_RETRY_SECONDS
-        self.retried = False
+        self.first_write_at: float | None = None
 
     # Outbox ---------------------------------------------------------------
 
     def enqueue(self, caption: Caption) -> None:
-        """Add an accepted revision; coalesce unless the client is keeping up."""
+        """Add an accepted revision. While the client is held back, it
+        replaces the unsent older revisions of its segment."""
         if self.closing:
             return
-        queue = self.pending.get(caption.segment)
-        if self.lean:
-            self.catching_up = True  # waiting finals may leave as one HISTORY
-        if queue is None:
-            self.pending[caption.segment] = deque((caption,))
-            self.n_pending += 1
-        elif self.mode == FULL and not self.lean:
-            queue.append(caption)
-            self.n_pending += 1
-        else:
-            # Lagging: the newer revision makes the unsent ones obsolete. A
-            # final is the newest revision of its segment, so it is never lost.
-            self.n_pending += 1 - len(queue)
-            queue.clear()
-            queue.append(caption)
-
-        if self.n_pending > MAX_PENDING:
-            self.compact()
-        oldest = next(iter(self.pending.values()))[0]
-        if (self.n_pending > MAX_PENDING
-                or self.loop.time() - oldest.received > MAX_PENDING_AGE):
+        self.outbox.add(caption, replace=self.mode != FULL or self.gate.holding)
+        if self.outbox.count > MAX_PENDING:
+            self.outbox.compact()
+        if (self.outbox.count > MAX_PENDING
+                or self.loop.time() - self.outbox.head().received > MAX_PENDING_AGE):
             self.overflow()
             return
         self.wake.set()
-
-    def compact(self) -> None:
-        """Keep only the newest unsent revision of every segment."""
-        for queue in self.pending.values():
-            if len(queue) > 1:
-                newest = queue[-1]
-                queue.clear()
-                queue.append(newest)
-        self.n_pending = len(self.pending)
-
-    def pop(self) -> Caption:
-        segment, queue = next(iter(self.pending.items()))
-        caption = queue.popleft()
-        self.n_pending -= 1
-        if not queue:
-            del self.pending[segment]
-        return caption
-
-    def leading_finals(self) -> list[Caption]:
-        """Unsent finals at the front of the outbox (candidates for one HISTORY)."""
-        batch = []
-        for queue in self.pending.values():
-            if not queue[0].final:
-                break
-            batch.append(queue[0])
-            if len(batch) >= CATCHUP_MAX_FINALS:
-                break
-        return batch
 
     def overflow(self) -> None:
         """Last resort for a client hopelessly behind: keep state bounded and
         let the client resume through HISTORY."""
         self.closing = True
-        self.pending.clear()
-        self.n_pending = 0
+        self.outbox.clear()
         self.wake.set()
         print(f"client {self.client_id}: more than {MAX_PENDING_AGE:.0f}s behind; "
               "closing so it can resume through HISTORY", flush=True)
@@ -518,17 +625,17 @@ class ClientSession:
     # Sender ---------------------------------------------------------------
 
     async def run(self) -> None:
-        """Sender task: drain the outbox according to the delivery mode."""
+        """Sender task: drain the outbox as the two loops allow."""
         try:
             while self.preamble:
                 await self.write(self.preamble.popleft())
             while not self.closing:
                 self.wake.clear()
                 delay = self.poll(self.loop.time())
-                if self.confirm_needed:
-                    self.confirm_needed = False
-                    self.last_confirm_at = self.loop.time()
-                    self.confirms += 1
+                if self.reader.confirm_needed:
+                    self.reader.confirm_needed = False
+                    self.reader.last_confirm_at = self.loop.time()
+                    self.reader.confirms += 1
                     waiter = await self.ws.ping()
                     waiter.add_done_callback(consume_result)
                     continue
@@ -543,149 +650,95 @@ class ClientSession:
             pass
 
     def poll(self, now: float) -> float | None:
-        """Update the delivery mode. Return 0.0 if the next message may be sent
-        now, otherwise how long to wait (None: until woken)."""
+        """Apply both loops. Return 0.0 if the head message may be written now,
+        otherwise how long to wait (None: until woken)."""
         deadline = None
-        if self.probe_sent_at is not None and self.mode != HOLD:
-            expected = self.probe_sent_at + self.rtt_min  # pong due on a clear path
-            check_at = expected + DELIVERY_GRACE
-            if self.probe_delivered_at is None and now >= check_at:
-                if self.ping_delivered():
-                    self.probe_delivered_at = now
-                elif not self.probe_congested:
-                    # Queued or lost on the way: probe this client less often.
-                    self.probe_congested = True
-                    self.probe_backoff = min(PROBE_BACKOFF_MAX, 2 * self.probe_backoff)
-            if self.probe_delivered_at is None:
-                # Still in the network (or answered before the check): no
-                # sign of a slow reader yet, keep sending and look again.
-                deadline = check_at if now < check_at else now + HOLD_SAMPLE_INTERVAL
-            else:
-                overdue_at = max(expected + LAG_MARGIN, self.probe_delivered_at + DELIVERY_GRACE)
-                if now >= overdue_at:
-                    self.enter_hold()
-                else:
-                    deadline = overdue_at
 
+        def until(t: float | None) -> None:
+            nonlocal deadline
+            if t is not None:
+                deadline = t if deadline is None else min(deadline, t)
+
+        # Loop 2: has the library stopped reading?
+        if self.mode != HOLD:
+            stalled, wait = self.reader.check(now)
+            if stalled:
+                self.enter_hold(now)
+            elif wait is not None:
+                until(now + wait)
         if self.mode == HOLD:
-            if self.acked_since is None:
-                outstanding = unacked_bytes(self.ws)
-                if (outstanding is None or outstanding == 0
-                        or tcp_info_field(tcp_info(self.ws), TCPI_SND_WND, "<I") == 0):
-                    # Everything we wrote has reached the client's kernel, or
-                    # its receive buffer is full (or the platform cannot
-                    # tell), yet the pong is missing.
-                    self.acked_since = now
-            self.watch_client_data()
-            if self.client_reading:
-                self.release_hold(now)  # and carry on sending below
-            else:
-                if now - self.last_confirm_at >= CONFIRM_INTERVAL:
-                    self.confirm_needed = BACKPRESSURE
-                return HOLD_SAMPLE_INTERVAL  # keep watching until on_pong() ends the hold
-
+            self.reader.watch(now)
+            if not self.reader.client_reading:
+                if now - self.reader.last_confirm_at >= CONFIRM_INTERVAL:
+                    self.reader.confirm_needed = BACKPRESSURE
+                return PROBE_CHECK  # until the pong ends the hold
+            self.release_hold(now)
         if self.mode == PACED:
-            retry_at = self.paced_since + self.retry_after
+            retry_at = self.pacer.since + self.pacer.retry_after
             if now >= retry_at:
                 self.leave_paced()
             else:
-                deadline = retry_at if deadline is None else min(deadline, retry_at)
+                until(retry_at)
 
-        if self.n_pending and self.mode == PACED:
-            rate = self.pace_rate()
-            self.tokens = min(PACE_BURST, self.tokens + (now - self.tokens_at) * rate)
-            self.tokens_at = now
-            need = 1.0 if next(iter(self.pending.values()))[0].final else PACE_BURST
-            if self.tokens >= need:
-                return 0.0
-            ready_at = now + (need - self.tokens) / rate
-            deadline = ready_at if deadline is None else min(deadline, ready_at)
-        elif self.n_pending:
-            head_final = next(iter(self.pending.values()))[0].final
-            if self.lean and not head_final and self.slow_path() and self.in_flight():
-                GATED.add(self)  # watch_links() wakes us once it is acknowledged
+        if not self.outbox:
+            return None if deadline is None else max(deadline - now, 0.001)
+        head = self.outbox.head()
+
+        # Loop 1: provisionals wait while the path is behind; finals never do.
+        if not head.final:
+            if self.gate.behind(now):
+                if not self.gate.holding:
+                    self.gate.holding = True
+                    self.outbox.compact()
+                self.catching_up = True
+                WAITING.add(self)  # watch_network() wakes us when ACKs catch up
                 return None if deadline is None else max(deadline - now, 0.001)
-            GATED.discard(self)
-            return 0.0
-        return None if deadline is None else max(deadline - now, 0.001)
+            self.gate.holding = False
 
-    def in_flight(self) -> bool:
-        """Is anything we wrote still unacknowledged by the client's TCP?"""
-        return bool(unacked_bytes(self.ws))
-
-    def slow_path(self) -> bool:
-        """TCP's smoothed RTT is at least LEAN_GATE_RTT. On a faster path,
-        waiting for each ACK (checked every LINK_TICK) would only add delay."""
-        rtt = tcp_info_field(tcp_info(self.ws), TCPI_RTT, "<I")
-        return rtt is None or rtt >= LEAN_GATE_RTT * 1e6
-
-    def check_link(self, now: float) -> None:
-        """Go lean when a message has been unacknowledged for LEAN_ENTER_AGE
-        while the path queues by more than LEAN_QUEUEING (a lost packet on a
-        jittery path does not count); go back once queueing has stayed under
-        QUEUEING_STOP for LEAN_EXIT_SECONDS."""
-        acked = tcp_info_field(tcp_info(self.ws), TCPI_BYTES_ACKED, "<Q")
-        if acked is None:
-            return
-        writes = self.unacked_writes
-        while writes and writes[0][0] <= acked:
-            writes.popleft()
-        age = now - writes[0][1] if writes else 0.0
-        delay = self.queueing_delay()
-        known = delay is not None and delay != math.inf
-        queueing = known and delay > QUEUEING_STOP
-        if not self.lean:
-            if age > LEAN_ENTER_AGE and known and delay > LEAN_QUEUEING:
-                self.lean = True
-                self.lean_calm_since = None
-                print(f"client {self.client_id}: a message unacknowledged for {age:.1f}s, "
-                      f"path queueing {delay:.2f}s; lean delivery "
-                      "(finals at once, one provisional in flight)", flush=True)
-        elif queueing:
-            self.lean_calm_since = None
-        elif self.lean_calm_since is None:
-            self.lean_calm_since = now
-        elif now - self.lean_calm_since >= LEAN_EXIT_SECONDS:
-            self.lean = False
-            self.wake.set()
-            print(f"client {self.client_id}: path not queueing for {LEAN_EXIT_SECONDS:.0f}s; "
-                  "normal delivery", flush=True)
+        if self.mode == PACED:
+            finals_waiting = len(self.outbox.leading_finals(2)) >= 2
+            wait = self.pacer.wait(now, head.final, finals_waiting)
+            if wait > 0:
+                until(now + wait)
+                return max(deadline - now, 0.001)
+        return 0.0
 
     async def send_next(self) -> None:
         batch = []
         if self.catchup_allowed and (self.mode != FULL or self.catching_up):
-            batch = self.leading_finals()
+            batch = self.outbox.leading_finals(CATCHUP_MAX_FINALS)
         if len(batch) >= CATCHUP_MIN_FINALS:
             for _ in batch:
-                self.pop()
+                self.outbox.pop()
             text = history_text([caption.text for caption in batch])
         else:
-            text = self.pop().text
+            text = self.outbox.pop().text
         if self.mode == PACED:
-            self.tokens -= 1.0
-        if not self.pending:
+            self.pacer.spend()
+        if not self.outbox:
             self.catching_up = False
 
-        probe_due = self.probe_due(self.loop.time())
-        # Cork so the caption and its probe ping leave in one TCP segment.
-        corked = probe_due and set_cork(self.ws, True)
+        probe = self.reader.due(self.frames_sent)
+        # Cork so the caption and its ping leave in one TCP segment.
+        corked = probe and set_cork(self.ws, True)
         try:
             await self.write(text)
-            if probe_due:
-                await self.probe(self.loop.time())
+            if probe:
+                await self.reader.probe(self.loop.time(), self.frames_sent,
+                                        self.last_write_at, self.on_pong)
         finally:
             if corked:
                 set_cork(self.ws, False)
 
     async def write(self, text: str) -> None:
         await self.ws.send(text)
+        now = self.loop.time()
         self.frames_sent += 1
-        self.last_write_at = self.loop.time()
-        self.write_times.append(self.last_write_at)
-        if LEAN:
-            end = stream_position(self.ws)
-            if end is not None:
-                self.unacked_writes.append((end, self.last_write_at))
+        self.last_write_at = now
+        self.write_times.append(now)
+        if self.first_write_at is None:
+            self.first_write_at = now
+        self.gate.wrote(now)
 
     def send_rate(self, until: float) -> float:
         """Messages per second written to this client in the SEND_RATE_WINDOW
@@ -697,227 +750,87 @@ class ClientSession:
         span = until - max(start, self.write_times[0])
         return len(recent) / span if span > 0 else 0.0
 
-    def pace_rate(self) -> float:
-        """Messages per second for a PACED client: its full reading rate while
-        unsent finals are piling up, a safety margin below it otherwise."""
-        leading_finals = 0
-        for queue in self.pending.values():
-            if not queue[0].final:
-                break
-            leading_finals += 1
-            if leading_finals >= 2:
-                return self.reading_rate
-        return PACING_FRACTION * self.reading_rate
-
-    # Lag probes and mode changes ------------------------------------------
-
-    def probe_due(self, now: float) -> bool:
-        """Should the message about to be written carry a lag probe?"""
-        if not BACKPRESSURE or self.probe_sent_at is not None or self.lean:
-            return False
-        since = now - self.last_probe_at
-        backoff = self.probe_backoff
-        if since < PROBE_INTERVAL * backoff:
-            return False
-        if not (self.mode != FULL or now - self.lag_seen_at < WATCH_SECONDS
-                or since >= HEALTHY_PROBE_INTERVAL * backoff
-                or self.frames_sent - self.frames_at_probe >= HEALTHY_PROBE_FRAMES * backoff):
-            return False
-        return not self.link_queueing()
-
-    def queueing_delay(self) -> float | None:
-        """TCP's smoothed RTT above the base RTT, in seconds: math.inf before
-        the first RTT sample, None if the platform cannot tell."""
-        global BASE_RTT_US
-        info = tcp_info(self.ws)
-        rtt = tcp_info_field(info, TCPI_RTT, "<I")
-        min_rtt = tcp_info_field(info, TCPI_MIN_RTT, "<I")
-        if rtt is None or min_rtt is None:
-            return None
-        if 0 < min_rtt < 0xFFFFFFFF:  # all ones: no sample yet
-            BASE_RTT_US = min(BASE_RTT_US, min_rtt)
-        if rtt == 0 or BASE_RTT_US == math.inf:
-            return math.inf
-        return (rtt - BASE_RTT_US) / 1e6
-
-    def link_queueing(self) -> bool:
-        """Is the path to this client queueing? TCP's smoothed RTT more than
-        QUEUEING_STOP above the base RTT stops probing until it is back under
-        QUEUEING_RESUME. Without an RTT sample yet, wait."""
-        queueing = self.queueing_delay()
-        if queueing is None:
-            return False  # platform cannot tell: probe as usual
-        if queueing == math.inf:
-            return True
-        limit = QUEUEING_RESUME if self.queueing else QUEUEING_STOP
-        self.queueing = queueing > limit
-        return self.queueing
-
-    async def probe(self, now: float) -> None:
-        self.probe_sent_at = self.last_probe_at = now
-        self.probe_delivered_at = None
-        self.probe_congested = False
-        self.frames_at_probe = self.frames_sent
-        self.probe_last_write = self.last_write_at
-        waiter = await self.ws.ping()
-        self.probe_end = stream_position(self.ws)
-        waiter.add_done_callback(lambda done, sent_at=now: self.on_pong(done, sent_at))
-
-    def ping_delivered(self) -> bool:
-        """Has the client's TCP received the outstanding probe? True when the
-        platform cannot tell, so any late pong then counts as lag."""
-        if self.reply_gap is not None:
-            counters = tcp_receive_counters(self.ws)
-            if counters is not None and counters[0] == self.reply_gap:
-                return False  # its answer is stuck behind the lost reply
-            self.reply_gap = None
-        info = tcp_info(self.ws)
-        acked = tcp_info_field(info, TCPI_BYTES_ACKED, "<Q")
-        if self.probe_end is None or acked is None:
-            return True
-        return acked >= self.probe_end or tcp_info_field(info, TCPI_SND_WND, "<I") == 0
+    # Loop 2: holds and pacing ---------------------------------------------
 
     def on_pong(self, waiter: asyncio.Future, sent_at: float) -> None:
-        failed = waiter.cancelled() or waiter.exception() is not None
-        if self.probe_sent_at != sent_at:
+        if self.reader.sent_at != sent_at:
+            return  # an earlier ping, or one given up on in release_hold()
+        if waiter.cancelled() or waiter.exception() is not None:
+            self.reader.sent_at = None
             return
-        self.probe_sent_at = None
-        if failed:
-            return
-        now = self.loop.time()
-        if not self.probe_congested:
-            self.probe_backoff = max(1.0, self.probe_backoff / 2)
         if self.mode == HOLD:
-            self.leave_hold(now, now - sent_at)
-        else:
-            self.add_rtt(now - sent_at)
-        self.confirmed_write_at = self.probe_last_write
-        self.frames_confirmed = self.frames_at_probe
+            self.leave_hold(self.loop.time())
+        self.reader.confirm()
         self.wake.set()
 
-    def add_rtt(self, rtt: float) -> None:
-        self.rtts.append(rtt)
-        self.rtt_min = min(self.rtts)
-
-    def watch_client_data(self) -> None:
-        """A client whose application has stopped reading cannot answer our
-        pings, so it sends no data. If a data segment from it arrives that the
-        kernel cannot deliver yet (data_segs_in rises, in-order bytes do not),
-        the client is reading and its earlier reply is stuck in TCP
-        retransmission: the stall is the network's."""
-        if self.client_reading or self.hold_counters is None:
-            return
-        current = tcp_receive_counters(self.ws)
-        if current is None:
-            return
-        delivered, segments = current
-        base_delivered, base_segments = self.hold_counters
-        if delivered != base_delivered:
-            self.hold_counters = current  # in-order data, e.g. a client keepalive ping
-        elif segments > base_segments:
-            self.client_reading = True
-
-    def enter_hold(self) -> None:
+    def enter_hold(self, now: float) -> None:
         self.mode_before_hold = self.mode
         self.mode = HOLD
-        self.lag_seen_at = self.loop.time()
-        self.hold_counters = tcp_receive_counters(self.ws)
-        self.client_reading = False
-        self.confirms = 0
-        # A client that is still reading answers this ping, and that answer
-        # reaches our kernel even if an earlier reply is being retransmitted.
-        self.confirm_needed = BACKPRESSURE
-        # The client stopped reading between the last message it confirmed and
-        # the overdue probe; the earlier bound gives a conservative (lower)
-        # reading-rate estimate.
-        if self.confirmed_write_at is not None:
-            self.hold_onset = max(self.confirmed_write_at, self.probe_sent_at - ONSET_LOOKBACK)
-        else:
-            self.hold_onset = self.probe_sent_at
-        self.acked_since = None
-        self.compact()
+        self.reader.hold_started()
+        # The library stopped reading after the last message it confirmed:
+        # measuring the stall from there gives a lower bound on the reading
+        # rate, so pacing never outruns the reader.
+        self.hold_onset = (self.reader.confirmed_write_at or self.first_write_at or now)
+        self.outbox.compact()
+
+    def release_hold(self, now: float) -> None:
+        """The client answered a later ping while the earlier answer is
+        missing: it is reading, and that answer was lost on the way back."""
+        self.reader.release()
+        self.mode = self.mode_before_hold
+        self.catching_up = bool(self.outbox)
+        self.pacer.tokens_at = now
+        print(f"client {self.client_id}: {now - self.hold_onset:.1f}s stall treated as "
+              "network delay, not a slow reader (client answered a later ping)", flush=True)
+
+    def leave_hold(self, now: float) -> None:
+        """The pong arrived: the library resumed after the application read
+        DRAIN_FRAMES messages, which gives the reading rate."""
+        stall = max(now - self.hold_onset, 1e-3)
+        previous = self.mode_before_hold
+        self.catching_up = bool(self.outbox)
+        self.reader.watch(now)
+        measured = DRAIN_FRAMES / stall
+        sent = self.send_rate(self.hold_onset)
+        if not PACING or self.reader.client_reading or measured >= sent:
+            # It reads at least as fast as we send: the stall was the network
+            # (a delayed pong) or a burst, not a slow reader.
+            self.mode = previous
+            self.pacer.tokens_at = now
+            if stall >= LOG_STALL:
+                print(f"client {self.client_id}: {stall:.1f}s stall treated as network delay, "
+                      f"not a slow reader (reads ~{measured:.2f} msg/s, we sent ~{sent:.2f})",
+                      flush=True)
+            return
+        if previous == FULL and self.pacer.retried:
+            # It stalled again after a retry at full rate: retry later next time.
+            self.pacer.retry_after = min(2 * self.pacer.retry_after, PACED_RETRY_MAX)
+        # Still queued on the client's side: LIBRARY_RESUME messages, plus
+        # everything written since the last confirmed read except the one
+        # that filled the library's queue.
+        still_queued = LIBRARY_RESUME + max(0, self.frames_sent - self.reader.confirmed_frames - 1)
+        self.pacer.start(measured, still_queued, now)
+        self.mode = PACED
+        print(f"client {self.client_id}: slow reader (stalled {stall:.1f}s, reads "
+              f"~{self.pacer.rate:.2f} msg/s, we sent ~{sent:.2f}); pacing", flush=True)
+
+    def leave_paced(self) -> None:
+        """Stall-free for a while: try full-rate delivery again."""
+        self.mode = FULL
+        self.pacer.retried = True
+        print(f"client {self.client_id}: no stall for {self.pacer.retry_after:.0f}s; "
+              "trying full rate again", flush=True)
 
     def describe(self, now: float) -> str:
         """One-line state for diagnostics."""
         state = f"client {self.client_id}: mode={self.mode}"
         if self.mode == HOLD:
-            state += (f" for {now - self.hold_onset:.1f}s, confirmations={self.confirms}, "
-                      f"all_acked={self.acked_since is not None}, client_reading={self.client_reading}")
-        state += (f", lean={self.lean}, pending={self.n_pending}, written={self.frames_sent}, "
-                  f"last write {now - self.last_write_at:.1f}s ago, probe_backoff={self.probe_backoff:g}")
+            state += (f" for {now - self.hold_onset:.1f}s, confirmations={self.reader.confirms}, "
+                      f"client_reading={self.reader.client_reading}")
+        state += (f", network lag {self.gate.lag(now):.2f}s holding={self.gate.holding}, "
+                  f"pending={self.outbox.count}, written={self.frames_sent}, "
+                  f"last write {now - self.last_write_at:.1f}s ago")
         return f"{state}; tcp: {tcp_report(self.ws)}"
-
-    def release_hold(self, now: float) -> None:
-        """The client answered a later ping while the probe's answer is still
-        missing: it is reading, and that answer was lost on the way back.
-        Resume now instead of waiting for TCP to resend it, and do not hold
-        again until the lost data has arrived."""
-        counters = tcp_receive_counters(self.ws)
-        self.reply_gap = counters[0] if counters is not None else None
-        self.probe_sent_at = None  # its late pong is ignored
-        self.mode = self.mode_before_hold
-        self.catching_up = self.n_pending > 0
-        self.tokens_at = now
-        print(f"client {self.client_id}: {now - self.hold_onset:.1f}s stall treated as "
-              "network delay, not a slow reader (client answered a later ping)", flush=True)
-
-    def leave_hold(self, now: float, probe_rtt: float) -> None:
-        stall = now - self.hold_onset
-        previous = self.mode_before_hold
-        self.catching_up = self.n_pending > 0
-        self.watch_client_data()
-        measured = DRAIN_FRAMES / stall
-        sent = self.send_rate(self.hold_onset)
-        all_acked = self.acked_since is not None and now - self.acked_since >= RECEIVER_CONFIRM
-        receiver_limited = (
-            stall >= MIN_RECEIVER_STALL
-            and all_acked
-            and not self.client_reading
-            and measured <= READER_RATE_RATIO * sent
-        )
-        if not receiver_limited or not PACING:
-            # Network queueing, loss recovery or a short hiccup: resume the
-            # previous mode with the coalesced (newest) state.
-            if not receiver_limited:
-                self.add_rtt(probe_rtt)
-                if stall >= MIN_RECEIVER_STALL and all_acked:
-                    reason = ("client kept sending data" if self.client_reading else
-                              f"would mean reading ~{measured:.2f} msg/s while we sent ~{sent:.2f}")
-                    print(f"client {self.client_id}: {stall:.1f}s stall treated as network "
-                          f"delay, not a slow reader ({reason})", flush=True)
-            self.mode = previous
-            self.tokens_at = now
-            return
-
-        if previous == PACED:
-            measured = min(measured, 0.7 * self.reading_rate)  # stalled while paced
-        elif self.retried:
-            self.retry_after = min(2 * self.retry_after, PACED_RETRY_MAX)
-        self.reading_rate = max(MIN_PACE_RATE, measured)
-        self.mode = PACED
-        # Token debt: let the client read the messages still queued on its
-        # side (RESUME_QUEUE plus anything written after the overdue probe)
-        # before sending more, so what it reads next is current. It stopped
-        # reading somewhere after the last answered probe, so messages
-        # written between that probe and the overdue one may be queued too.
-        # Probing every message, that is only the overdue probe's own
-        # caption, which RESUME_QUEUE was measured with; a client probed
-        # once a second can have several.
-        unconfirmed = max(0, self.frames_at_probe - self.frames_confirmed - 1)
-        still_queued = RESUME_QUEUE + unconfirmed + (self.frames_sent - self.frames_at_probe)
-        self.tokens = 1.0 - still_queued
-        self.tokens_at = now
-        self.paced_since = now
-        print(f"client {self.client_id}: slow reader (stalled {stall:.1f}s, reads "
-              f"~{self.reading_rate:.2f} msg/s, we sent ~{sent:.2f}); pacing", flush=True)
-
-    def leave_paced(self) -> None:
-        """Stall-free for a while: try full-rate delivery again."""
-        self.mode = FULL
-        self.retried = True
-        self.lag_seen_at = self.loop.time()  # keep probing it closely
-        print(f"client {self.client_id}: no stall for {self.retry_after:.0f}s; "
-              "trying full rate again", flush=True)
 
 
 def history_text(items: list[str]) -> str:
@@ -1163,7 +1076,7 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
         pass
     finally:
         session.clients.discard(client)
-        GATED.discard(client)
+        WAITING.discard(client)
         client.closing = True
         sender.cancel()
         try:
@@ -1206,16 +1119,12 @@ def report_stats() -> None:
     if not clients:
         return
     modes = Counter(client.mode for client in clients)
-    queued = sum(client.n_pending for client in clients)
+    queued = sum(client.outbox.count for client in clients)
     history = sum(len(session.finals) for session in SESSIONS.values())
-    backed_off = sum(client.probe_backoff > 1 for client in clients)
-    queueing = sum(client.queueing for client in clients)
-    base = f"{BASE_RTT_US / 1000:.3f}ms" if BASE_RTT_US != math.inf else "none"
-    lean = sum(client.lean for client in clients)
+    network = sum(client.gate.holding for client in clients)
     print(f"stats: clients={len(clients)} full={modes[FULL]} hold={modes[HOLD]} "
           f"paced={modes[PACED]} queued={queued} history_finals={history} "
-          f"probe_backoff={backed_off} queueing={queueing} base_rtt={base} "
-          f"lean={lean} waiting_for_ack={len(GATED)}", flush=True)
+          f"network_held={network} waiting_for_ack={len(WAITING)}", flush=True)
     now = asyncio.get_running_loop().time()
     held = sorted((client for client in clients
                    if client.mode == HOLD and now - client.hold_onset > REPORT_HELD_AFTER),
@@ -1240,25 +1149,19 @@ async def housekeeping() -> None:
             report_stats()
 
 
-async def watch_links() -> None:
-    """Wake lean clients whose last message has been acknowledged, and check
-    every client's oldest unacknowledged message every LINK_CHECK_INTERVAL.
-    One task polls the kernel for all clients (asyncio has no event for an
-    incoming ACK)."""
+async def watch_network() -> None:
+    """Loop 1's wake-up: asyncio has no event for an incoming ACK, so one task
+    looks at the clients waiting for their path to catch up every LINK_TICK
+    and wakes those whose oldest unacknowledged message is young enough
+    again."""
     loop = asyncio.get_running_loop()
-    next_check = loop.time()
     while True:
         await asyncio.sleep(LINK_TICK)
-        for client in list(GATED):
-            if client.closing or not client.in_flight():
-                GATED.discard(client)
-                client.wake.set()
         now = loop.time()
-        if now >= next_check:
-            next_check = now + LINK_CHECK_INTERVAL
-            for session in list(SESSIONS.values()):
-                for client in list(session.clients):
-                    client.check_link(now)
+        for client in list(WAITING):
+            if client.closing or not client.gate.behind(now):
+                WAITING.discard(client)
+                client.wake.set()
 
 
 class PortCheckFilter(logging.Filter):
@@ -1296,11 +1199,11 @@ async def main_async(port: int) -> None:
         ping_timeout=60,
     ):
         spawn(housekeeping())
-        if LEAN:
-            spawn(watch_links())
+        if NETWORK_GATE:
+            spawn(watch_network())
         print(f"LiveRecall server listening on ws://0.0.0.0:{port} "
               f"(backpressure={BACKPRESSURE}, pacing={PACING}, "
-              f"catchup_history={CATCHUP_HISTORY}, lean={LEAN})", flush=True)
+              f"network_gate={NETWORK_GATE}, catchup_history={CATCHUP_HISTORY})", flush=True)
         await asyncio.Future()
 
 

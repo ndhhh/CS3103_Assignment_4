@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # TCP feedback traces under several network conditions, for design
 # measurements (see experiments/trace_tcp_feedback.py). The server runs in
-# open loop (no lag probes, no lean delivery), so the traces show what TCP
-# reports before any of our control acts on it. Run as your normal user:
+# open loop (no pings, no network gate), so the traces show what TCP reports
+# before any of our control acts on it. Run as your normal user:
 #     bash experiments/run_trace_suite.sh [output_dir]
 # Conditions with tc need sudo (asked once); loopback is reset on exit.
 #
@@ -102,7 +102,7 @@ for entry in "${CONDITIONS[@]}"; do
   apply_network "$network"
   "$PY" experiments/trace_tcp_feedback.py run "$OUT/$label" --port "$PORT" \
     --clients "$clients" --slow-percent "$slow" --duration "$DURATION" \
-    --server-env LIVERECALL_BACKPRESSURE=0 --server-env LIVERECALL_LEAN=0 \
+    --server-env LIVERECALL_BACKPRESSURE=0 --server-env LIVERECALL_NETWORK_GATE=0 \
     > "$OUT/$label.log" 2>&1 || echo "    FAILED, see $OUT/$label.log"
   done_dirs+=("$OUT/$label")
 done

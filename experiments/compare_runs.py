@@ -8,7 +8,8 @@ for example by run_impairment_tests.sh or run_robustness_sweep.sh. For every
 scenario found, it prints the median across runs of the main metrics, the
 lowest per-run final completeness, how many clients went silent (nothing
 received in the last 10 s of a run, from the CSV) and, when the scenario's
-server log is present, the server's lean-delivery and slow-reader decisions.
+server log is present, how many clients the server paced as slow readers and
+how many of those the load client had not made slow ("paced/wrong").
 Public-test folders hold several servers' files with an "ours_" or
 "teammate_" prefix; each prefix gets its own row (folder:ours, ...).
 """
@@ -77,13 +78,29 @@ def silent_clients(csv_path: str) -> int | None:
     return sum(1 for c in clients if end - last.get(c, 0.0) > 10)
 
 
-def decisions(json_path: str) -> str:
-    """Lean-delivery and slow-reader decisions in the scenario's server log."""
-    log = re.sub(r"_run\d\d\.json$", "", json_path) + ".log"
+def slow_ids(csv_path: str) -> set[str]:
+    """Clients the load client made slow readers."""
+    if not os.path.exists(csv_path):
+        return set()
+    with open(csv_path, newline="") as f:
+        return {row["client_id"] for row in csv.DictReader(f) if row["slow"] == "1"}
+
+
+def decisions(paths: list[str]) -> str:
+    """Clients paced as slow readers in the scenario's server log, and how
+    many of them the load client had not made slow (paced/wrong)."""
+    log = re.sub(r"_run\d\d\.json$", "", paths[0]) + ".log"
     if not os.path.exists(log):
         return "-"
     text = open(log, encoding="utf-8", errors="replace").read()
-    return f"{text.count('lean delivery (')}/{text.count('slow reader (stalled')}"
+    # One server start per run; the runs' logs follow each other in order.
+    per_run = text.split("LiveRecall server listening")[1:] or [text]
+    paced = wrong = 0
+    for log_run, path in zip(per_run, paths):
+        ids = set(re.findall(r"client (\S+): slow reader \(stalled", log_run))
+        paced += len(ids)
+        wrong += len(ids - slow_ids(path[:-5] + ".csv"))
+    return f"{paced}/{wrong}"
 
 
 def row(paths: list[str]) -> list[str]:
@@ -98,7 +115,7 @@ def row(paths: list[str]) -> list[str]:
     cells.append(str(sum((value(s, "duplicates") or 0) + (value(s, "stale") or 0) for s in summaries)))
     silent = [silent_clients(p[:-5] + ".csv") for p in paths]
     cells.append("/".join("-" if s is None else str(s) for s in silent))
-    cells.append(decisions(paths[0]))
+    cells.append(decisions(paths))
     cells.append(str(len(paths)))
     return cells
 
@@ -114,7 +131,7 @@ def main() -> None:
     scenarios = sorted({s for runs in per_folder for s in runs})
     labels = [label for runs in per_folder for by_label in runs.values() for label in by_label]
     headers = ["folder"] + [c[0] for c in COLUMNS] + ["minCompl", "errors", "dup+stale",
-                                                      "silent", "lean/slow", "runs"]
+                                                      "silent", "paced/wrong", "runs"]
     widths = [max(map(len, labels + ["folder"])) + 2] + [max(9, len(h) + 2) for h in headers[1:]]
     for scenario in scenarios:
         if only and scenario not in only:
