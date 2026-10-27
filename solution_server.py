@@ -78,18 +78,19 @@ client much farther away than the others would look congested and simply not
 be probed.
 
 Lean delivery on an overloaded link: when a message sent to a client is still
-unacknowledged after 1 s, that client's share of the link cannot carry the
+unacknowledged after 1 s and the path is queueing (TCP's RTT more than 0.2 s
+above the base RTT), that client's share of the link cannot carry the
 caption stream, and everything handed to TCP queues behind it (lost segments
-hold up all later ones). The client then gets at most one provisional
+hold up all later ones). A late message on a path that is not queueing (a
+single loss being repaired) does not count. The client then gets at most one provisional
 revision in flight: the next is written only once TCP has acknowledged what
 was sent, and meanwhile newer revisions replace the unsent older revisions
 of the same segment. Finals never wait: they are written at once (waiting
 finals as one catch-up HISTORY). What is sent is therefore current, and
 fewer bytes compete for the link. The wait applies only while TCP's smoothed
 RTT is at least 50 ms, so a lean client whose link recovers gets every
-revision again at once; it returns to normal delivery after 10 s without a
-message unacknowledged for 1 s (a loss episode on a slow path costs ~10 s of
-lean delivery). Lean clients are not probed.
+revision again at once; it returns to normal delivery once its path has not
+been queueing for 10 s. Lean clients are not probed.
 
 Experiment switches (environment variables, inherited by run_demo.py):
     LIVERECALL_BACKPRESSURE=0     no lag probes: always FULL
@@ -208,9 +209,8 @@ PACED_RETRY_SECONDS = 60.0   # stall-free this long: try full rate again
 PACED_RETRY_MAX = 600.0
 
 # Lean delivery on an overloaded link (one message in flight, coalescing).
-LEAN_ENTER_AGE = 1.0         # a message unacknowledged this long: go lean
-LEAN_EXIT_AGE = LEAN_ENTER_AGE  # back to normal once no message stayed unacknowledged
-LEAN_EXIT_SECONDS = 10.0        # longer than LEAN_EXIT_AGE for this long
+LEAN_ENTER_AGE = 1.0         # a message unacknowledged this long on a queueing path: go lean
+LEAN_EXIT_SECONDS = 10.0     # path not queueing (QUEUEING_STOP) this long: back to normal
 LINK_TICK = 0.05             # how often waiting lean clients are checked for an ACK
 LEAN_GATE_RTT = 0.05         # one message in flight only if TCP's RTT is at least this
 LINK_CHECK_INTERVAL = 0.25   # how often every client's oldest unacknowledged message is checked
@@ -618,9 +618,10 @@ class ClientSession:
         return rtt is None or rtt >= LEAN_GATE_RTT * 1e6
 
     def check_link(self, now: float) -> None:
-        """Track the oldest unacknowledged message. Go lean when it is older
-        than LEAN_ENTER_AGE; go back once no message has stayed unacknowledged
-        longer than LEAN_EXIT_AGE for LEAN_EXIT_SECONDS."""
+        """Go lean when a message has been unacknowledged for LEAN_ENTER_AGE
+        on a queueing path (a single loss on an uncongested path does not
+        count); go back once the path has not been queueing for
+        LEAN_EXIT_SECONDS."""
         acked = tcp_info_field(tcp_info(self.ws), TCPI_BYTES_ACKED, "<Q")
         if acked is None:
             return
@@ -628,20 +629,23 @@ class ClientSession:
         while writes and writes[0][0] <= acked:
             writes.popleft()
         age = now - writes[0][1] if writes else 0.0
+        delay = self.queueing_delay()
+        queueing = delay is not None and delay != math.inf and delay > QUEUEING_STOP
         if not self.lean:
-            if age > LEAN_ENTER_AGE:
+            if age > LEAN_ENTER_AGE and queueing:
                 self.lean = True
                 self.lean_calm_since = None
-                print(f"client {self.client_id}: a message unacknowledged for {age:.1f}s; "
-                      "lean delivery (finals at once, one provisional in flight)", flush=True)
-        elif age > LEAN_EXIT_AGE:
+                print(f"client {self.client_id}: a message unacknowledged for {age:.1f}s, "
+                      f"path queueing {delay:.2f}s; lean delivery "
+                      "(finals at once, one provisional in flight)", flush=True)
+        elif queueing:
             self.lean_calm_since = None
         elif self.lean_calm_since is None:
             self.lean_calm_since = now
         elif now - self.lean_calm_since >= LEAN_EXIT_SECONDS:
             self.lean = False
             self.wake.set()
-            print(f"client {self.client_id}: link keeping up for {LEAN_EXIT_SECONDS:.0f}s; "
+            print(f"client {self.client_id}: path not queueing for {LEAN_EXIT_SECONDS:.0f}s; "
                   "normal delivery", flush=True)
 
     async def send_next(self) -> None:
@@ -718,21 +722,30 @@ class ClientSession:
             return False
         return not self.link_queueing()
 
-    def link_queueing(self) -> bool:
-        """Is the path to this client queueing? TCP's smoothed RTT more than
-        QUEUEING_STOP above the base RTT stops probing until it is back under
-        QUEUEING_RESUME. Without an RTT sample yet, wait."""
+    def queueing_delay(self) -> float | None:
+        """TCP's smoothed RTT above the base RTT, in seconds: math.inf before
+        the first RTT sample, None if the platform cannot tell."""
         global BASE_RTT_US
         info = tcp_info(self.ws)
         rtt = tcp_info_field(info, TCPI_RTT, "<I")
         min_rtt = tcp_info_field(info, TCPI_MIN_RTT, "<I")
         if rtt is None or min_rtt is None:
-            return False  # platform cannot tell: probe as usual
+            return None
         if 0 < min_rtt < 0xFFFFFFFF:  # all ones: no sample yet
             BASE_RTT_US = min(BASE_RTT_US, min_rtt)
         if rtt == 0 or BASE_RTT_US == math.inf:
+            return math.inf
+        return (rtt - BASE_RTT_US) / 1e6
+
+    def link_queueing(self) -> bool:
+        """Is the path to this client queueing? TCP's smoothed RTT more than
+        QUEUEING_STOP above the base RTT stops probing until it is back under
+        QUEUEING_RESUME. Without an RTT sample yet, wait."""
+        queueing = self.queueing_delay()
+        if queueing is None:
+            return False  # platform cannot tell: probe as usual
+        if queueing == math.inf:
             return True
-        queueing = (rtt - BASE_RTT_US) / 1e6
         limit = QUEUEING_RESUME if self.queueing else QUEUEING_STOP
         self.queueing = queueing > limit
         return self.queueing
