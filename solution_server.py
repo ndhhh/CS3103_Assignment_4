@@ -46,13 +46,23 @@ Loop 2, the application (pongs). A websockets client reads ahead into a
 above 16 and resumes at 4. Its kernel keeps acknowledging data, so loop 1
 cannot see a slow reader, and its receive window stays open (128 KB buffers
 for ~42-byte compressed messages). The one application-level signal is the
-pong: the library answers a ping only when it reads it. So every 8th message
-(half the library queue) carries a ping. When the client's TCP has
-acknowledged a ping but no pong has come back within PONG_GRACE, the library
-has stopped reading: the client is held (nothing is written). When the pong
-arrives, the stall length gives the reading rate (the library resumes after
-the application has read 12 messages); a client that reads slower than we
-were sending is then paced just below that rate, finals first.
+pong: the library answers a ping only when it reads it. So every 4th message
+carries a ping. When the client's TCP has acknowledged a ping but no pong has
+come back within PONG_GRACE, the library has stopped reading: the client is
+held (nothing is written). When the pong arrives, the stall length gives the
+reading rate (the library resumes after the application has read 12
+messages); a client that reads slower than we were sending is then paced
+just below that rate, finals first, starting once the messages still queued
+on its side have been read. The ping spacing is how precisely we know where
+the library stopped: what we wrote after that point is backlog the reader
+must still get through, and the queued count must assume the worst case
+within one spacing. Every 4th message keeps that within the 4 messages the
+library itself leaves queued, at one extra packet (our ACK of the pong) per
+4 messages.
+
+When the source has finished (SOURCE_DONE, or its connection closed),
+nothing newer is coming, so pacing has nothing left to keep current: paced
+clients get what is left at once.
 
 A pong can also be lost on the way back; TCP then repairs it only on a
 growing timeout, because the client has nothing else to send. A held client
@@ -156,8 +166,8 @@ UNACKED_WRITES = 1024        # write positions remembered per client
 LIBRARY_QUEUE = 16
 LIBRARY_RESUME = 4
 DRAIN_FRAMES = LIBRARY_QUEUE - LIBRARY_RESUME
-PROBE_EVERY = LIBRARY_QUEUE // 2  # a ping on every 8th message: a stall is seen
-                                  # within 8 messages, at one pong per 8
+PROBE_EVERY = LIBRARY_RESUME  # a ping on every 4th message: where the library
+                              # stopped is known to within 4 messages
 PONG_GRACE = 0.25            # pong still missing this long after the client's TCP
                              # acknowledged the ping: the library is not reading
                              # (allows for a busy client process)
@@ -254,6 +264,7 @@ class SessionState:
         self.name = name
         self.clients: set[ClientSession] = set()
         self.sources = 0
+        self.ended = False  # the source finished: nothing newer is coming
         self.reset()
 
     def reset(self) -> None:
@@ -274,6 +285,7 @@ class SessionState:
             return None
 
         caption = Caption(segment, revision, msg["final"], now, text)
+        self.ended = False
         self.latest[segment] = caption
         if caption.final:
             self.active.pop(segment, None)
@@ -296,6 +308,12 @@ class SessionState:
     def publish(self, caption: Caption) -> None:
         for client in self.clients:
             client.enqueue(caption)
+
+    def end_stream(self) -> None:
+        """The source finished: paced clients may take what is left."""
+        self.ended = True
+        for client in self.clients:
+            client.wake.set()
 
     def expire_finals(self, now: float) -> None:
         cutoff = now - HISTORY_RETENTION_SECONDS
@@ -695,7 +713,7 @@ class ClientSession:
                 return None if deadline is None else max(deadline - now, 0.001)
             self.gate.holding = False
 
-        if self.mode == PACED:
+        if self.mode == PACED and not self.session.ended:
             finals_waiting = len(self.outbox.leading_finals(2)) >= 2
             wait = self.pacer.wait(now, head.final, finals_waiting)
             if wait > 0:
@@ -988,7 +1006,8 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
     Read messages from a caption source and publish accepted caption updates.
 
     Invalid JSON, invalid updates, stale revisions and unsupported message
-    types are ignored. SOURCE_DONE is logged but not forwarded.
+    types are ignored. SOURCE_DONE is not forwarded; it ends pacing until
+    the next caption.
     """
     hello_session = session_name(hello.get("session"))
     get_session(hello_session).sources += 1
@@ -1027,10 +1046,14 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                     session.publish(caption)
             elif msg_type == "SOURCE_DONE":
                 print("source finished", flush=True)
+                get_session(session_name(msg.get("session", hello_session))).end_stream()
     except ConnectionClosed:
         pass
     finally:
-        get_session(hello_session).sources -= 1
+        session = get_session(hello_session)
+        session.sources -= 1
+        if session.sources == 0:
+            session.end_stream()
         print("source disconnected", flush=True)
 
 
