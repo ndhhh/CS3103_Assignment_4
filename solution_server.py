@@ -28,6 +28,7 @@ import asyncio
 import json
 import math
 import time
+from contextlib import suppress
 from typing import Any
 
 import websockets
@@ -149,11 +150,9 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
                 if not validate_caption_update(msg):
-                    await prune_history()
                     continue
 
                 accepted_caption = upsert_caption(msg)
-                await prune_history()
                 if accepted_caption is None:
                     continue
 
@@ -182,7 +181,13 @@ async def prune_history(max_history: int = MAX_HISTORY):
     # Take only captions that existed in the last `max_history` seconds
     pruned_captions = [c for c in SAVED_CAPTIONS if 0 <= current_time - c.get("source_ts") <= max_history]
     SAVED_CAPTIONS[:] = pruned_captions # Overwrite
-    
+
+
+async def prune_history_periodically() -> None:
+    """Prune expired captions every second, including while the source is idle."""
+    while True:
+        await prune_history()
+        await asyncio.sleep(1)
 
 
 async def handle_client(ws, hello: dict[str, Any]) -> None:
@@ -308,8 +313,14 @@ async def main_async(port: int) -> None:
         ping_interval=20,
         ping_timeout=20,
     ):
-        print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
-        await asyncio.Future()
+        prune_task = asyncio.create_task(prune_history_periodically())
+        try:
+            print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
+            await asyncio.Future()
+        finally:
+            prune_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await prune_task
 
 
 def main() -> None:
