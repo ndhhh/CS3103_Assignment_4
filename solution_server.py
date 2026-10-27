@@ -80,15 +80,16 @@ be probed.
 Lean delivery on an overloaded link: when a message sent to a client is still
 unacknowledged after 1 s, that client's share of the link cannot carry the
 caption stream, and everything handed to TCP queues behind it (lost segments
-hold up all later ones). The client then gets one message in flight at a
-time: the next is written only once TCP has acknowledged the previous one,
-and meanwhile newer revisions replace the unsent older revisions of the same
-segment (finals are never dropped; waiting finals can leave as one catch-up
-HISTORY). What is sent is therefore current, and fewer bytes compete for the
-link. The one-in-flight rule applies only while TCP's smoothed RTT is at
-least 50 ms, so a lean client whose link recovers gets every revision again
-at once; it returns to normal delivery once nothing has stayed
-unacknowledged for more than 0.25 s for 10 s. Lean clients are not probed.
+hold up all later ones). The client then gets at most one provisional
+revision in flight: the next is written only once TCP has acknowledged what
+was sent, and meanwhile newer revisions replace the unsent older revisions
+of the same segment. Finals never wait: they are written at once (waiting
+finals as one catch-up HISTORY). What is sent is therefore current, and
+fewer bytes compete for the link. The wait applies only while TCP's smoothed
+RTT is at least 50 ms, so a lean client whose link recovers gets every
+revision again at once; it returns to normal delivery after 10 s without a
+message unacknowledged for 1 s (a loss episode on a slow path costs ~10 s of
+lean delivery). Lean clients are not probed.
 
 Experiment switches (environment variables, inherited by run_demo.py):
     LIVERECALL_BACKPRESSURE=0     no lag probes: always FULL
@@ -208,8 +209,8 @@ PACED_RETRY_MAX = 600.0
 
 # Lean delivery on an overloaded link (one message in flight, coalescing).
 LEAN_ENTER_AGE = 1.0         # a message unacknowledged this long: go lean
-LEAN_EXIT_AGE = 0.25         # back to normal once no message stayed unacknowledged
-LEAN_EXIT_SECONDS = 10.0     # longer than LEAN_EXIT_AGE for this long
+LEAN_EXIT_AGE = LEAN_ENTER_AGE  # back to normal once no message stayed unacknowledged
+LEAN_EXIT_SECONDS = 10.0        # longer than LEAN_EXIT_AGE for this long
 LINK_TICK = 0.05             # how often waiting lean clients are checked for an ACK
 LEAN_GATE_RTT = 0.05         # one message in flight only if TCP's RTT is at least this
 LINK_CHECK_INTERVAL = 0.25   # how often every client's oldest unacknowledged message is checked
@@ -598,7 +599,8 @@ class ClientSession:
             ready_at = now + (need - self.tokens) / rate
             deadline = ready_at if deadline is None else min(deadline, ready_at)
         elif self.n_pending:
-            if self.lean and self.slow_path() and self.in_flight():
+            head_final = next(iter(self.pending.values()))[0].final
+            if self.lean and not head_final and self.slow_path() and self.in_flight():
                 GATED.add(self)  # watch_links() wakes us once it is acknowledged
                 return None if deadline is None else max(deadline - now, 0.001)
             GATED.discard(self)
@@ -631,7 +633,7 @@ class ClientSession:
                 self.lean = True
                 self.lean_calm_since = None
                 print(f"client {self.client_id}: a message unacknowledged for {age:.1f}s; "
-                      "lean delivery (one message in flight)", flush=True)
+                      "lean delivery (finals at once, one provisional in flight)", flush=True)
         elif age > LEAN_EXIT_AGE:
             self.lean_calm_since = None
         elif self.lean_calm_since is None:
