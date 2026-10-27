@@ -34,7 +34,9 @@ class ClientState:
 
 
 CLIENTS: dict[Any, ClientState] = {}
-SAVED_CAPTIONS: list[Any] = []
+# Server state saves captions with a dict, indexed by (session, segment)
+# for future extension if multiple sessions are added.
+SAVED_CAPTIONS: dict[tuple[str, int], Any] = {}
 
 MAX_HISTORY = 90
 MAX_MESSAGE_BYTES = 2**20
@@ -72,32 +74,27 @@ def validate_caption_update(msg: Any) -> bool:
 
 def upsert_caption(msg: dict[str, Any]) -> dict[str, Any] | None:
     """Store and return a newer caption revision, or reject stale/duplicate state."""
-    existing_index = next(
-        (
-            index
-            for index, caption in enumerate(SAVED_CAPTIONS)
-            if caption.get("session") == msg["session"]
-            and caption.get("segment") == msg["segment"]
-        ),
-        None,
-    )
-
+    key = (msg["session"], msg["segment"])
+    existing_caption = SAVED_CAPTIONS.get(key)
     accepted_caption = dict(msg)
-    if existing_index is None:
-        SAVED_CAPTIONS.append(accepted_caption)
-        return accepted_caption
 
-    existing_caption = SAVED_CAPTIONS[existing_index]
+    # Save new caption if it is not found in history, i.e. completely fresh
+    if existing_caption is None:
+        SAVED_CAPTIONS[key] = accepted_caption
+        return accepted_caption
+    # Ignore caption if there exists a finalised caption with same segment number
     if existing_caption.get("final") is True:
         return None
+    # Ignore caption if there exists a more updated segment
     if msg["revision"] <= existing_caption.get("revision", 0):
         return None
-
-    SAVED_CAPTIONS[existing_index] = accepted_caption
+    # Else save entire caption (a dict) in the server state
+    SAVED_CAPTIONS[key] = accepted_caption
     return accepted_caption
 
 
 def close_client(client, reason="Connection closed"):
+    """Close a client, removing them from stored clients, as well as their outbox."""
     if client.closing is None:
         CLIENTS.pop(client.ws, None)
         client.outbox.close()
@@ -106,9 +103,11 @@ def close_client(client, reason="Connection closed"):
 
 
 async def publish_update(update):
+    """Offers the updated caption to each client via their outbox to handle slow clients."""
     message = encode_message(update)
     clients = tuple(client for client in CLIENTS.values() if not client.recovering)
     for index, client in enumerate(clients, 1):
+        # If client outbox cannot fit new caption, set it to recovery state
         if not client.outbox.offer(message):
             client.recovering = True
             client.history_since = time.time() - MAX_HISTORY
@@ -117,6 +116,10 @@ async def publish_update(update):
 
 
 async def send_client_messages(client):
+    """
+    Depletes each client's outbox, updates recovery cursors after sends, 
+    and retries history recovery (to catch up with server) when the queue drains.
+    """
     sent = 0
     try:
         while True:
@@ -145,6 +148,10 @@ async def send_client_messages(client):
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
+    """
+    Reads message from connected source and sends it to be
+    updated in client state + offers to all clients' bounded outboxes.
+    """
     async for raw in ws:
         try:
             msg = json.loads(raw)
@@ -161,20 +168,28 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
 
 async def prune_history(max_history: int = MAX_HISTORY):
     """Remove captions outside the server's retention window."""
+    global SAVED_CAPTIONS # Reference to the global state dict.
     current_time = time.time()
-    SAVED_CAPTIONS[:] = [
-        c for c in SAVED_CAPTIONS if 0 <= current_time - c["source_ts"] <= max_history
-    ]
+    SAVED_CAPTIONS = {
+        key: caption for key, caption in SAVED_CAPTIONS.items()
+        if 0 <= current_time - caption["source_ts"] <= max_history
+    }
 
 
 async def prune_history_periodically() -> None:
-    """Prune expired captions every second, including while the source is idle."""
+    """
+    Prune expired captions every second, including while the source is idle.
+
+    Update: This was previously only run everytime the server got a new caption from source,
+    which led to stale captions being kept continuously when source is idle.
+    """
     while True:
         await prune_history()
         await asyncio.sleep(1)
 
 
 def validate_client_hello(hello):
+    """Check for Client HELLO fields."""
     segment = hello.get("last_segment")
     revision = hello.get("last_revision")
     seconds = hello.get("history_seconds")
@@ -189,6 +204,12 @@ def validate_client_hello(hello):
 
 
 def queue_history(client, items):
+    """
+    Offer client queue a HISTORY packet without blocking
+    and resets its `needs_history` status if successful.
+
+    If outbox is full, failure is reported (for client to recover).
+    """
     if not client.outbox.offer(encode_message({"type": "HISTORY", "items": items})):
         return False
     client.needs_history = False
@@ -196,10 +217,16 @@ def queue_history(client, items):
 
 
 def queue_recovery(client):
+    """
+    Rebuild client's missing recent finalised and 
+    newer active provisional captions from server state.
+
+    Return False if unable to be queued.
+    """
     now = time.time()
     cursor = client.cursor
     captions = sorted(
-        (c for c in SAVED_CAPTIONS if c["session"] == client.session),
+        (c for c in SAVED_CAPTIONS.values() if c["session"] == client.session),
         key=lambda c: c["source_ts"],
     )
     items = []
@@ -241,10 +268,14 @@ def queue_recovery(client):
 
 
 async def handle_client(ws, hello):
+    """Handles a connection from a client (be it old or new)."""
+    # Do nothing if client HELLO is malformed
     if not validate_client_hello(hello):
         await ws.close(code=1008, reason="Invalid client hello")
         return
 
+    # Cursor keeps track of the client's state: 
+    # its last segment and revision
     cursor = (hello["last_segment"], hello["last_revision"])
     client = ClientState(ws, session=hello["session"], cursor=cursor, last_update=cursor,
                          history_since=time.time() - hello["history_seconds"])
@@ -253,15 +284,19 @@ async def handle_client(ws, hello):
     CLIENTS[ws] = client
     client.sender = asyncio.create_task(send_client_messages(client))
     try:
+        # Keep client websocket open.
         async for raw in ws:
             try:
                 message = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            # Set slow mode if client tells server it is slow. 
+            # This is used in the technical demo.
             if (isinstance(message, dict) and message.get("type") == "CLIENT_SETTINGS"
                     and type(message.get("slow")) is bool):
                 client.slow_mode = message["slow"]
     finally:
+        # Close client when it is disconnected.
         await close_client(client)
         client.sender.cancel()
         with suppress(asyncio.CancelledError):
@@ -269,13 +304,18 @@ async def handle_client(ws, hello):
 
 
 async def handler(ws) -> None:
+    """
+    Top level handler objects for all requests (client, source HELLO).
+    Respective requests are routed to their specific (client or source) handlers.
+    """
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=5)
         hello = json.loads(raw)
+        # Ignore malformed/non-HELLO messages
         if not isinstance(hello, dict):
             await ws.close(code=1008, reason="Expected a hello object")
             return
-
+        # Route each HELLO to their respective handlers
         if hello.get("type") == "SOURCE_HELLO":
             await handle_source(ws, hello)
         elif hello.get("type") == "CLIENT_HELLO":

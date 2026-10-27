@@ -15,6 +15,7 @@ class OutboundMessage:
 
 
 def encode_message(message):
+    """Encodes a JSON message into an `OutboundMessage`."""
     text = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
     key = None
     position = None
@@ -27,15 +28,19 @@ def encode_message(message):
 
 
 class ClientOutbox:
+    """Main class; representation of a queue for a client to receive from."""
     def __init__(self, max_items=128, max_bytes=2 * 1024 * 1024):
+        # Default cap of 128 captions and 2 MiB of data
         self.max_items = max_items
         self.max_bytes = max_bytes
-        self.pending = deque()
+        self.pending = deque() # Main (de)queue object
         self.ready = asyncio.Event()
         self.count = 0
         self.bytes = 0
-        self.closed = False
+        self.closed = False # Is client socket closed
         self.pressured = False
+        # Tracks when get() passes packet to be sent so in-flight data 
+        # is still considered in pressure/size accounting
         self.sending_since = None
 
     def offer(self, message):
@@ -63,6 +68,12 @@ class ClientOutbox:
         return True
 
     def _compact_pending(self, message, now):
+        """
+        Compacts the pending queue down.
+
+        Removes obsolete provsional updates for the same session + segment, keeping the newest queued state.
+        This does not affect finalised captions waiting to be sent.
+        """
         pending = [*self.pending, (message, now)]
         kept = []
         seen = set()
@@ -87,6 +98,10 @@ class ClientOutbox:
         return True
 
     async def get(self):
+        """
+        Wait until packet(s) arrives or the outbox closes
+        then return the next packet for sending.
+        """
         while not self.pending:
             if self.closed:
                 return None
@@ -95,10 +110,16 @@ class ClientOutbox:
         if self.pressured or time.monotonic() - self.pending[0][1] >= 0.25:
             self._batch_finals()
         message, _ = self.pending.popleft()
+        # Keep packet to be sent marked as in-flight until complete() 
+        # is called after the sending attempt.
         self.sending_since = time.monotonic()
         return message
 
     def _batch_finals(self):
+        """
+        Replace consecutive queued final caption messages at the front 
+        with one bounded HISTORY packet.
+        """
         messages = []
         size = len('{"type":"HISTORY","items":[]}')
         for message, _ in self.pending:
