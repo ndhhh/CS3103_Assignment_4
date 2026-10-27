@@ -177,7 +177,8 @@ SEND_RATE_WINDOW = 10.0      # seconds of writes used for the sending rate
 LOG_STALL = 1.0              # stalls shorter than this are not logged
 
 # Pacing slow readers.
-PACING_FRACTION = 0.85       # steady state: 85% of the measured reading rate
+PACING_FRACTION = 0.85       # steady state: 85% of the estimated reading rate,
+                             # which is at most ~14% high (see enter_hold)
 MIN_PACE_RATE = 0.2          # messages per second
 PACE_BURST = 2.0             # token bucket depth; a provisional needs a spare
                              # token so the next final is not delayed by it
@@ -758,6 +759,13 @@ class ClientSession:
             self.first_write_at = now
         self.gate.wrote(now)
 
+    def write_time(self, frame: int) -> float | None:
+        """When the frame-th message was written, if still remembered."""
+        back = self.frames_sent - frame
+        if 0 <= back < len(self.write_times):
+            return self.write_times[-1 - back]
+        return None
+
     def send_rate(self, until: float) -> float:
         """Messages per second written to this client in the SEND_RATE_WINDOW
         before `until` (or since its first write, if that is more recent)."""
@@ -785,10 +793,15 @@ class ClientSession:
         self.mode_before_hold = self.mode
         self.mode = HOLD
         self.reader.hold_started()
-        # The library stopped reading after the last message it confirmed:
-        # measuring the stall from there gives a lower bound on the reading
-        # rate, so pacing never outruns the reader.
-        self.hold_onset = (self.reader.confirmed_write_at or self.first_write_at or now)
+        # The library stopped reading after one of the messages from the last
+        # answered ping up to the one before the unanswered ping. The middle
+        # of that interval is off by at most (PROBE_EVERY - 1) / 2 messages of
+        # our sending, against a stall of DRAIN_FRAMES reads by a reader
+        # slower than us: the reading rate comes out at most ~14% high, and
+        # pacing at PACING_FRACTION of it stays below the true rate.
+        earliest = self.reader.confirmed_write_at or self.first_write_at or now
+        latest = self.write_time(self.reader.frames_at_probe - 1) or earliest
+        self.hold_onset = (earliest + max(earliest, latest)) / 2
         self.outbox.compact()
 
     def release_hold(self, now: float) -> None:
