@@ -26,7 +26,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import time
+from contextlib import suppress
 from typing import Any
 
 import websockets
@@ -46,6 +48,62 @@ CLIENTS_DISCONNECTED: set[Any] = set()
 SAVED_CAPTIONS: list[Any] = []
 
 MAX_HISTORY = 90
+
+
+def validate_caption_update(msg: Any) -> bool:
+    """Return whether a source message has the fields needed for revision state."""
+    if not isinstance(msg, dict):
+        return False
+
+    session = msg.get("session")
+    segment = msg.get("segment")
+    revision = msg.get("revision")
+    source_ts = msg.get("source_ts")
+    if isinstance(source_ts, bool) or not isinstance(source_ts, (int, float)):
+        return False
+    try:
+        finite_timestamp = math.isfinite(float(source_ts))
+    except (OverflowError, ValueError):
+        return False
+
+    return (
+        isinstance(session, str)
+        and bool(session.strip())
+        and type(segment) is int
+        and segment > 0
+        and type(revision) is int
+        and revision > 0
+        and finite_timestamp
+        and isinstance(msg.get("text"), str)
+        and type(msg.get("final")) is bool
+    )
+
+
+def upsert_caption(msg: dict[str, Any]) -> dict[str, Any] | None:
+    """Store and return a newer caption revision, or reject stale/duplicate state."""
+    existing_index = next(
+        (
+            index
+            for index, caption in enumerate(SAVED_CAPTIONS)
+            if caption.get("session") == msg["session"]
+            and caption.get("segment") == msg["segment"]
+        ),
+        None,
+    )
+
+    accepted_caption = dict(msg)
+    if existing_index is None:
+        SAVED_CAPTIONS.append(accepted_caption)
+        return accepted_caption
+
+    existing_caption = SAVED_CAPTIONS[existing_index]
+    if existing_caption.get("final") is True:
+        return None
+    if msg["revision"] <= existing_caption.get("revision", 0):
+        return None
+
+    SAVED_CAPTIONS[existing_index] = accepted_caption
+    return accepted_caption
 
 
 async def broadcast_naively(raw_message: str) -> None:
@@ -86,52 +144,19 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(msg, dict):
+                continue
 
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
-                session = msg.get("session")
-                segment = msg.get("segment")
-                revision = msg.get("revision")
-                source_ts = msg.get("source_ts")
-                final = msg.get("final")
-
-                """
-                Add message to server's history (to send to new/reconnecting clients)
-                Under overload, the server may suppress obsolete provisional revisions. 
-                However, it must preserve the final caption for every completed segment 
-                and the latest available revision of any currently active segment.
-                """
-                # Add type checks first
-                # if type(segment) is not int or type(revision) is not int:
-                #     continue
-                existing_caption = next(
-                    (
-                        c for c in SAVED_CAPTIONS
-                        if c.get("segment") == segment
-                        and c.get("session") == session
-                    ),
-                    None
-                )
-
-                if existing_caption is None:
-                    # If caption does not exist, add to list
-                    SAVED_CAPTIONS.append(msg)
-                elif existing_caption.get("final") is True:
-                    # If existing caption is final, don't edit
+                if not validate_caption_update(msg):
                     continue
-                elif revision > existing_caption.get("revision", 0):
-                    # Remove and add new updated caption
-                    existing_caption["revision"] = revision
-                    existing_caption["text"] = msg.get("text")
-                    existing_caption["source_ts"] = source_ts
-                    existing_caption["final"] = final
 
-                await prune_history()
+                accepted_caption = upsert_caption(msg)
+                if accepted_caption is None:
+                    continue
 
-                # Baseline behavior: forward exactly what was received.
-                # No history, state, validation, coalescing, or bounded queues.
-                # TODO: Update this
-                await broadcast_naively(raw)
+                await broadcast_naively(json.dumps(accepted_caption))
                 
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
@@ -156,7 +181,13 @@ async def prune_history(max_history: int = MAX_HISTORY):
     # Take only captions that existed in the last `max_history` seconds
     pruned_captions = [c for c in SAVED_CAPTIONS if 0 <= current_time - c.get("source_ts") <= max_history]
     SAVED_CAPTIONS[:] = pruned_captions # Overwrite
-    
+
+
+async def prune_history_periodically() -> None:
+    """Prune expired captions every second, including while the source is idle."""
+    while True:
+        await prune_history()
+        await asyncio.sleep(1)
 
 
 async def handle_client(ws, hello: dict[str, Any]) -> None:
@@ -282,8 +313,14 @@ async def main_async(port: int) -> None:
         ping_interval=20,
         ping_timeout=20,
     ):
-        print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
-        await asyncio.Future()
+        prune_task = asyncio.create_task(prune_history_periodically())
+        try:
+            print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
+            await asyncio.Future()
+        finally:
+            prune_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await prune_task
 
 
 def main() -> None:
