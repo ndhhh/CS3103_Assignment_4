@@ -27,7 +27,6 @@ class ClientState:
     history_since: float = 0
     recovering: bool = False
     needs_history: bool = True
-    slow_mode: bool = False
     outbox: ClientOutbox = field(default_factory=ClientOutbox)
     sender: asyncio.Task | None = None
     closing: asyncio.Task | None = None
@@ -104,9 +103,13 @@ def close_client(client, reason="Connection closed"):
 
 async def publish_update(update):
     """Offers the updated caption to each client via their outbox to handle slow clients."""
+    # Snapshot before cooperative yields, then encode once and share the
+    # immutable packet across all client queues.
     message = encode_message(update)
-    clients = tuple(client for client in CLIENTS.values() if not client.recovering)
+    clients = tuple(CLIENTS.values())
     for index, client in enumerate(clients, 1):
+        if client.recovering:
+            continue
         # If client outbox cannot fit new caption, set it to recovery state
         if not client.outbox.offer(message):
             client.recovering = True
@@ -129,8 +132,6 @@ async def send_client_messages(client):
             if message is None:
                 break
             try:
-                if client.slow_mode:
-                    await asyncio.sleep(2)
                 await client.ws.send(message.text)
                 if message.position is not None:
                     client.last_update = max(client.last_update, message.position)
@@ -225,8 +226,11 @@ def queue_recovery(client):
     """
     now = time.time()
     cursor = client.cursor
+    # Exclude expired/future-dated entries before sorting; recovery only needs
+    # the retained window and this path may run repeatedly for slow clients.
     captions = sorted(
-        (c for c in SAVED_CAPTIONS.values() if c["session"] == client.session),
+        (c for c in SAVED_CAPTIONS.values()
+         if c["session"] == client.session and 0 <= now - c["source_ts"] <= MAX_HISTORY),
         key=lambda c: c["source_ts"],
     )
     items = []
@@ -279,6 +283,9 @@ async def handle_client(ws, hello):
     cursor = (hello["last_segment"], hello["last_revision"])
     client = ClientState(ws, session=hello["session"], cursor=cursor, last_update=cursor,
                          history_since=time.time() - hello["history_seconds"])
+    # Apply bounded provisional coalescing uniformly; no client-supplied slow
+    # flag or simulator behavior is needed to protect a lagging reader.
+    client.outbox.set_provisional_coalescing(True)
     client.recovering = not queue_recovery(client)
     # No await between taking the history snapshot and subscribing to live updates.
     CLIENTS[ws] = client
@@ -290,11 +297,6 @@ async def handle_client(ws, hello):
                 message = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            # Set slow mode if client tells server it is slow. 
-            # This is used in the technical demo.
-            if (isinstance(message, dict) and message.get("type") == "CLIENT_SETTINGS"
-                    and type(message.get("slow")) is bool):
-                client.slow_mode = message["slow"]
     finally:
         # Close client when it is disconnected.
         await close_client(client)

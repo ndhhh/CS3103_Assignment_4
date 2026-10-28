@@ -35,9 +35,12 @@ slowButton.disabled = true;
 
 function setSlowMode(enabled) {
   slowMode = enabled;
-  slowButton.textContent = enabled ? "Resume normal speed" : "Simulate slow client";
-  slowStatusEl.textContent = enabled ? "Slow simulation: one message every 2 seconds." : "";
+  slowButton.textContent = enabled ? "Disable slow-reader policy" : "Enable slow-reader policy";
+  slowStatusEl.textContent = enabled
+    ? "Slow-reader policy: coalesce provisional revisions and prioritize finals."
+    : "";
   if (ws?.readyState === WebSocket.OPEN) {
+    // Slow-reader enhancement: tell the server to use this client's bounded, final-prioritizing outbox policy.
     ws.send(JSON.stringify({ type: "CLIENT_SETTINGS", slow: enabled }));
   }
 }
