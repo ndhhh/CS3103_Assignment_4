@@ -4,7 +4,11 @@
 
 ## Tools and purposes
 
-- OpenAI Codex assisted Ong Cheng Leong with repository inspection, Ubuntu test commands, slow-client result analysis, and drafting the submission documentation. The team must add any other AI or coding assistants used by any member, including what each was used for.
+- OpenAI Codex assisted Ong Cheng Leong with repository inspection, Ubuntu test commands, slow-client result analysis, and drafting the submission documentation. 
+
+- ChatGPT Luna-6 assisted Ng De Heng with code quality and application logic checks during the set up of client and server states, as well as caption history handling on new client connections and reconnections. 
+
+- The team must add any other AI or coding assistants used by any member, including what each was used for.
 
 ## A useful suggestion and verification
 
