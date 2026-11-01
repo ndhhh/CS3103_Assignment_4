@@ -15,6 +15,8 @@ const liveEl = document.getElementById("live");
 const recallEl = document.getElementById("recall");
 const disconnectButton = document.getElementById("disconnect");
 const resetButton = document.getElementById("reset");
+const backToLiveButton = document.getElementById("back-to-live");
+const emptyStateEl = document.getElementById("empty-state");
 
 // Each value stores the latest caption fields plus the row used to display it.
 const CAPTIONS_STATE = new Map();
@@ -43,21 +45,24 @@ function createCaptionRow(segment) {
   row.className = "caption-line provisional";
   row.dataset.segment = String(segment);
 
-  // Insert by segment number. Existing rows keep their relative order, even if
-  // a previously unseen segment arrives after a later one.
+  const state = document.createElement("span");
+  state.className = "caption-state";
+  const text = document.createElement("span");
+  text.className = "caption-text";
+  row.append(state, text);
+
+  // Newest segments lead; revisions keep their existing row.
   const nextRow = [...liveEl.children].find(
-    (child) => Number(child.dataset.segment) > segment,
+    (child) => Number(child.dataset.segment) < segment,
   );
   liveEl.insertBefore(row, nextRow ?? null);
   return row;
 }
 
 function renderCaption(caption) {
-  const label = caption.final ? "FINAL" : "PROVISIONAL";
   caption.row.className = `caption-line ${caption.final ? "final" : "provisional"}`;
-  caption.row.textContent =
-    `[${label}] segment ${caption.segment} rev ${caption.revision}: ${caption.text}`;
-  liveEl.scrollTop = liveEl.scrollHeight;
+  caption.row.querySelector(".caption-state").textContent = caption.final ? "Final caption" : "Updating live";
+  caption.row.querySelector(".caption-text").textContent = caption.text;
 }
 
 function upsertCaption(msg) {
@@ -114,18 +119,37 @@ function pruneExpiredFinals(nowSeconds = Date.now() / 1000) {
   }
 }
 
-function renderRecall(seconds = recallWindowSeconds, nowSeconds = Date.now() / 1000) {
-  const recentFinals = [...CAPTIONS_STATE.values()]
-    .filter((caption) => {
-      const age = nowSeconds - caption.source_ts;
-      return caption.final && age >= 0 && age <= seconds;
-    })
-    .sort((a, b) => a.segment - b.segment);
+function captureReadingPosition() {
+  const anchor = [...liveEl.children].find(
+    (row) => !row.hidden && row.getBoundingClientRect().bottom > 0,
+  );
+  return { anchor, top: anchor?.getBoundingClientRect().top, scrollTop: window.scrollY };
+}
 
-  recallEl.textContent = recentFinals.length
-    ? recentFinals.map((caption) => `[${caption.segment}] ${caption.text}`).join("\n")
-    : `No finalized captions in the last ${seconds} seconds.`;
-  recallEl.scrollTop = recallEl.scrollHeight;
+function renderRecall(seconds = recallWindowSeconds, nowSeconds = Date.now() / 1000,
+                      view = captureReadingPosition()) {
+  let visibleCount = 0;
+  for (const row of liveEl.children) {
+    const caption = CAPTIONS_STATE.get(Number(row.dataset.segment));
+    const age = nowSeconds - caption.source_ts;
+    row.hidden = caption.final && (age < 0 || age > seconds);
+    if (row.hidden) continue;
+    row.classList.toggle("latest", visibleCount === 0);
+    visibleCount += 1;
+  }
+
+  if (view.scrollTop <= 24) {
+    window.scrollTo({ top: 0, behavior: "instant" });
+  } else if (view.anchor?.isConnected && !view.anchor.hidden) {
+    window.scrollBy({ top: view.anchor.getBoundingClientRect().top - view.top, behavior: "instant" });
+  }
+
+  backToLiveButton.hidden = window.scrollY <= 24;
+  emptyStateEl.hidden = visibleCount > 0;
+  recallEl.textContent = `Showing the last ${seconds} seconds`;
+  for (const button of document.querySelectorAll("button[data-seconds]")) {
+    button.setAttribute("aria-pressed", String(Number(button.dataset.seconds) === seconds));
+  }
 }
 
 function handleServerMessage(event) {
@@ -137,6 +161,7 @@ function handleServerMessage(event) {
     return;
   }
 
+  const view = captureReadingPosition();
   if (msg.type === "CAPTION_UPDATE") {
     upsertCaption(msg);
   } else if (msg.type === "HISTORY") {
@@ -158,15 +183,17 @@ function handleServerMessage(event) {
   }
 
   pruneExpiredFinals();
-  renderRecall();
+  renderRecall(recallWindowSeconds, Date.now() / 1000, view);
 }
 
 function connect() {
   statusEl.textContent = "connecting";
+  statusEl.dataset.state = "connecting";
   ws = new WebSocket(WS_URL);
 
   ws.addEventListener("open", () => {
     statusEl.textContent = "connected";
+    statusEl.dataset.state = "connected";
     console.log("Client connected.")
     disconnectButton.disabled = false;
     reconnectAttempt = 0;
@@ -184,6 +211,7 @@ function connect() {
 
   ws.addEventListener("close", () => {
     statusEl.textContent = "disconnected";
+    statusEl.dataset.state = "disconnected";
     disconnectButton.disabled = true;
     if (reconnectTimer !== null) return;
 
@@ -197,6 +225,7 @@ function connect() {
 
   ws.addEventListener("error", () => {
     statusEl.textContent = "connection error";
+    statusEl.dataset.state = "error";
   });
 }
 
@@ -207,6 +236,15 @@ for (const button of document.querySelectorAll("button[data-seconds]")) {
     renderRecall();
   });
 }
+
+window.addEventListener("scroll", () => {
+  backToLiveButton.hidden = window.scrollY <= 24;
+}, { passive: true });
+
+backToLiveButton.addEventListener("click", () => {
+  window.scrollTo({ top: 0, behavior: "instant" });
+  backToLiveButton.hidden = true;
+});
 
 disconnectButton.addEventListener("click", () => {
   if (ws?.readyState === WebSocket.OPEN) {
@@ -234,8 +272,9 @@ resetButton.addEventListener("click", () => {
 
 // Expire old finalized rows even when no new captions are arriving.
 setInterval(() => {
+  const view = captureReadingPosition();
   pruneExpiredFinals();
-  renderRecall();
+  renderRecall(recallWindowSeconds, Date.now() / 1000, view);
 }, 1000);
 
 renderRecall();

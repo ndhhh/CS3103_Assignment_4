@@ -4,34 +4,53 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>LiveRecall Student Client</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
-    #status { font-weight: 700; }
-    #live { min-height: 6rem; max-height: 22rem; overflow-y: auto; border: 1px solid #bbb; border-radius: .4rem; padding: 1rem; margin: 1rem 0; }
-    .caption-line { padding: .45rem 0; border-bottom: 1px dotted #ddd; }
-    .caption-line.provisional { color: #555; font-style: italic; }
-    .caption-line.final { color: #171717; }
-    button { padding: .55rem .75rem; margin: .2rem; }
-    #recall { white-space: pre-wrap; margin-top: 1rem; border-left: 3px solid #ccc; padding-left: 1rem; }
-    .hint { font-size: .9rem; color: #555; }
-  </style>
+  <link rel="stylesheet" href="styles.css?v=page-scroll">
 </head>
 <body>
-  <h1>LiveRecall</h1>
-  <div>
-    <p style="display:inline-block;">Connection: <span id="status">disconnected</span></p>
-    <button id="disconnect" type="button">Simulate disconnect</button>
-    <button id="reset" type="button">Reset client</button>
-  </div>
+  <div class="app">
+    <header class="app-header">
+      <div>
+        <a class="brand" href="./" aria-label="LiveRecall home">LiveRecall<span>.</span></a>
+        <details class="developer-options">
+          <summary>Developer options</summary>
+          <div class="developer-controls">
+            <p>Check reconnect and recovery behavior.</p>
+            <button id="disconnect" type="button">Simulate disconnect</button>
+            <button id="reset" type="button">Reset client</button>
+          </div>
+        </details>
+      </div>
+      <span id="status" role="status" data-state="disconnected">disconnected</span>
+    </header>
 
-  <p class="hint">Each segment keeps one row. Provisional revisions update it until the final caption arrives.</p>
-  <div id="live"></div>
-  <div>
-    <button data-seconds="30">What did I miss? (30 s)</button>
-    <button data-seconds="15">15 s</button>
-    <button data-seconds="60">60 s</button>
+    <main>
+      <section class="reader" aria-labelledby="reader-title">
+        <div class="reader-header">
+          <div>
+            <p class="eyebrow">Stay with the lecture</p>
+            <h1 id="reader-title">What did I miss?</h1>
+          </div>
+          <div class="window-picker" role="group" aria-label="Caption history window">
+            <button type="button" data-seconds="15" aria-pressed="false">15 s</button>
+            <button type="button" data-seconds="30" aria-pressed="true">30 s</button>
+            <button type="button" data-seconds="60" aria-pressed="false">60 s</button>
+          </div>
+        </div>
+
+        <p class="reader-hint">The latest sentence leads. Scroll down to catch up.</p>
+        <div class="caption-stage">
+          <div id="live" role="region" aria-label="Live captions, newest first"></div>
+          <p id="empty-state">Waiting for the next sentence<span>Live captions will appear here.</span></p>
+          <button id="back-to-live" type="button" hidden>Back to live <span aria-hidden="true">&#8593;</span></button>
+        </div>
+        <footer class="reader-footer">
+          <span id="recall">Showing the last 30 seconds</span>
+          <span>Newest first</span>
+        </footer>
+      </section>
+    </main>
+
   </div>
-  <div id="recall">No finalized captions in the last 30 seconds.</div>
-  <script src="app.js?v=ui-update"></script>
+  <script src="app.js?v=page-scroll"></script>
 </body>
 </html>
