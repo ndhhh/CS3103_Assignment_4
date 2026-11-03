@@ -26,48 +26,57 @@ State the trade-off clearly: coalescing lowers normal update coverage for affect
 
 ## 4. Public experimental method and results
 
-Run the supplied harness on Ubuntu with server and load clients in the same VM. Use three independent runs per scenario and report medians. Caption Age is client receive time minus source timestamp; report P50/P95/P99, fresh caption and fresh final ratios at the public 500 ms threshold, final completeness, and normal update coverage. T4 also needs recovery timing and duplicates/stale counts. T5 uses `tc/netem` on `lo` and must be reset after each experiment.
+The supplied harness, unmodified, starts a fresh server for each run. All runs used native Ubuntu 26.04 (Linux 7.0, 16 cores) with server, source and clients on one machine; T5 uses `tc/netem` on `lo`. Three runs per scenario, medians reported. Caption Age is client receive time minus source timestamp; freshness uses the public 500 ms threshold.
 
-**T1–T5 are medians from three-run Ubuntu summaries. T5's main row is the combined delay-and-loss profile; all three T5 profiles are shown below. Do not infer values from the old committed `demo_results.json`.**
+| Test | Condition | P50 ms | P95 ms | P99 ms | Fresh % | Fresh finals % | Completeness % | Coverage % |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| T1 | 20 clients | 1.2 | 1.9 | 2.1 | 100.0 | 100.0 | 100.00 | 100.00 |
+| T2 | 100 clients | 3.3 | 6.1 | 6.9 | 100.0 | 100.0 | 100.00 | 100.00 |
+| T3 | 100, 10% slow (500 ms/read) | 3.1 | 6.1 | 3603 | 98.4 | 97.0 | 100.00 | 94.39 |
+| T4 | 100, 20% disconnect for 5 s | 2.9 | 5.1 | 6.2 | 100.0 | 98.4 | 100.00 | 98.25 |
 
-| Test | Clients / condition | P50 ms | P95 ms | P99 ms | Fresh % | Fresh finals % | Final completeness % | Coverage % | Additional observation |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| T1 | 20, normal | 11 | 30 | 59 | 100.0 | 100.0 | 100.00 | 100.00 | Minimum per run 95.45%; 0 errors/duplicates/stale |
-| T2 | 100, normal | 20 | 41 | 52 | 100.0 | 100.0 | 100.00 | 100.00 | Minimum per run 97.96%; 0 errors/duplicates/stale |
-| T3 | 100, 10% slow at 500 ms/read | 21 | 50 | 3569 | 98.4 | 96.8 | 100.00 | 94.52 | Minimum 100%; slow-client P50 245 ms; 0 errors/duplicates/stale |
-| T4 | 100, 20% disconnect/reconnect | 19 | 38 | 45 | 100.0 | 98.4 | 100.00 | 98.25 | Recovery P95 15.1 ms; minimum 97.37%; 0 errors/duplicates/stale |
-| T5 | 100, 120 ± 30 ms delay + 3% IP loss | 293 | 818 | 1247 | 83.6 | 84.6 | 97.94 | 96.22 | Minimum per run 97.82%; 0 errors/duplicates/stale |
+Every run reached 100% completeness, with no duplicate, stale or connection-error events. T3: normal clients 100% fresh; slow readers P50 181 ms, P95 7.5 s. T4: recovery P95 3.4 ms.
 
-T5 ran on Linux loopback with `tc/netem`. Each profile had 100 clients, a 40-second window, and three completed runs. The first T5 folder also contains an incomplete attempt at the combined profile; the completed three-run retry in the second folder is used here.
+| T5 profile (100 clients, 40 s) | P50 ms | P95 ms | P99 ms | Fresh % | Fresh finals % | Completeness % | Coverage % |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 100 ± 20 ms delay | 202.6 | 249.5 | 266.6 | 100.0 | 100.0 | 100.00 | 100.00 |
+| 120 ± 30 ms delay + 3% loss | 252.8 | 690.9 | 959.8 | 91.3 | 87.8 | 100.00 | 97.97 |
+| 3% loss | 3.4 | 154.3 | 217.2 | 100.0 | 100.0 | 100.00 | 99.93 |
 
-| T5 profile | P50 ms | P95 ms | P99 ms | Fresh % | Fresh finals % | Final completeness % | Coverage % | Minimum completeness % |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 100 ± 20 ms delay | 222 | 273 | 296 | 100.0 | 100.0 | 100.00 | 100.00 | 100.00 |
-| 120 ± 30 ms delay + 3% loss | 293 | 818 | 1247 | 83.6 | 84.6 | 97.94 | 96.22 | 97.82 |
-| 3% loss | 26 | 64 | 274 | 99.8 | 85.7 | 85.71 | 86.33 | 83.67 |
+Delay shifts the whole distribution by about one round trip. Loss only hurts the tail: a lost segment is resent after TCP's 200 ms minimum retransmission timeout, and every caption behind it waits (head-of-line blocking), so P95/P99 sit near that timeout.
 
-No T5 run reported connection errors, duplicate captions, or stale captions. TCP retransmission preserves reliable, ordered WebSocket transport, but it can delay messages and create head-of-line stalls. The combined profile's P95 exceeded the 500 ms freshness threshold and its median final completeness fell below 99%. The loss-only profile's P95 stayed at 64 ms while final completeness fell to 85.71%; a low latency among observed messages therefore did not imply that all expected finals arrived before the 40-second cutoff. We cannot distinguish source timing, retry delay, and server behavior from these aggregate summaries alone; inspect per-run logs and timestamps before assigning a cause.
+## 5. Before/after comparison
 
-If the source takes longer than the client window on a constrained VM, report this timing limitation rather than treating unreceived future finals as a server failure. Keep the required public test result as measured, then use a fixed segment count and a longer client window for a controlled follow-up.
+Before: the team's earlier queue-based server (PR 8), which reacts only when its own outbox backs up. After: the final design. Same machine and harness, 3 runs each.
 
-T1–T4 all had 100% median final completeness and zero connection-error, duplicate, or stale events in the latest three-run summaries. Individual-run completeness dipped below 99% in T1, T2, and T4, despite those medians. This variability should be disclosed; the cause cannot be assigned to the server without inspecting source timing and per-run logs. T3's P99 reached 3.57 s because the slow-reader population contributes to the tail, while its median P95 remained 50 ms.
+| Scenario | Completeness % (before → after) | Key metric (before → after) |
+|---|---|---|
+| T3, 10% slow readers | 95.13 → 100.00 | slow-reader P50 14.7 s → 181 ms |
+| 30% slow readers | 85.39 → 100.00 | slow-reader P50 14.7 s → 204 ms |
+| Slow readers, 300 clients on 2 Mbit/s | 95.00 → 100.00 | slow-reader P50 14.6 s → 482 ms |
+| 700 clients on 2 Mbit/s | 89.51 → 99.99 | P95 7.0 s → 2.0 s |
+| 300 clients on 2 Mbit/s | 100 → 100 | P50 71 → 370 ms (regression, section 6) |
 
-## 5. Before/after slow-client comparison
+A slow reader's websockets library and kernel buffers absorb thousands of ~42 B messages before the earlier server's outbox backs up, so its slow readers ended about 15 s behind and missed finals. The final design detects the pause at the library through ping/pong and paces the reader. An earlier controlled study of the lag probes on a VM is in `docs/slow_client_evaluation.md`.
 
-Ong Cheng Leong ran a controlled A/B experiment on Ubuntu: 100 clients, 30% slow readers, 500 ms pause after each message, 76 source segments, 100-second client window, three independent runs per configuration. Lag probes were enabled in the final design and disabled with `LIVERECALL_BACKPRESSURE=0` in the comparison. The fixed source count and longer window followed an initial 60-second sweep in which normal and slow clients had similar incomplete final counts, indicating that the short window distorted completeness.
+## 6. Failures and trade-offs
 
-| Lag probes | Median overall P95 | Median slow-client P95 | Fresh final ratio | Final completeness by run | Connection-error events by run |
-|---|---:|---:|---:|---|---|
-| Enabled | 1,908 ms | 8,321 ms | 88.95% | 100%, 100%, 100% | 0, 0, 0 |
-| Disabled | 35,563 ms | 42,356 ms | 70.39% | 92.5%, 100%, 100% | 7, 30, 30 |
+What did not work (each measured, then dropped):
+- **Receive-window signal.** A slow reader's advertised TCP window stayed at 65,536 B with about 70 unread messages (128 KB buffers, ~42 B messages), so TCP cannot reveal a slow reader. Hence the ping/pong loop.
+- **TCP_NOTSENT_LOWAT.** Keeping unsent data in the outbox, where it can be replaced, gave nothing on a 2 Mbit/s bottleneck: the backlog was already in flight, not unsent.
+- **One ping per 8 messages.** The pause point was known only to within 8 messages, so the server overestimated what was still queued after a stall (12 vs about 8). Readers taking 2 s per message idled about 10 s and missed the last final (99.87%). A ping on every 4th message, with the stall timed from the middle of the uncertainty interval, fixed this (100%; T3 slow-reader P50 222 → 181 ms).
+- **Thresholds from TCP's retransmission timeout and the caption stream's rate.** On a congested link a late pong includes network delay, so the reading rate implied by a stall is wrong: 909 fast clients were paced at 500 clients, and worst-run completeness fell to 94.3% at 700 clients. Reverted.
 
-Lag probes lowered median slow-client P95 by about 34 seconds and improved the fresh final ratio by 18.56 percentage points. Normal-client P95 stayed below 30 ms in both configurations. Normal update coverage was 83.68% with probes and 92.73% without; this is consistent with coalescing obsolete provisional revisions during overload. Neither configuration produced duplicate or stale captions in these runs. The comparison is one controlled workload, not a prediction of hidden-test performance.
+Trade-offs we kept:
+- **Slow readers** get fewer provisionals but current text: T3 coverage 94.4% (queue-only server 95.2%), slow-reader P50 181 ms (14.7 s), completeness 100% (95.13%).
+- **Under overload**, provisionals wait in the outbox and are replaced while finals go out: coverage 61% vs 99% at 500 clients on 2 Mbit/s, but completeness 99.99% vs 89.5% at 700 clients.
+- **Probe precision costs bandwidth.** Each ping adds a pong and its ACK; at 300 clients on 2 Mbit/s P50 is 370 ms vs 71 ms.
+- **A slow reader's first ~15–20 s are stale** (8% fresh, then about 100%), because its library buffers 16 messages before any signal reaches the server. Shortening this would mean throttling every new client, which the coverage check penalizes.
+- **Lost pongs under heavy overload** still cause false holds (518 fast-client pacing decisions across our network runs).
 
-## 6. Failures, limitations, and future work
+## 7. Limitations and future work
 
-The initial 60-second slow-reader sweep produced low apparent completeness, but a per-role breakdown showed that normal and slow clients lost finals at nearly the same rate within each run. Extending the client window while fixing the source at 76 segments restored 100% completeness in all enabled runs. This shows why a load generator's production time and the client's observation window must be checked before attributing missing finals to delivery policy.
-
-Limitations include one Ubuntu VM for the controlled A/B result, only three runs per condition, a deterministic source rather than real speech, and T5 loss-profile completeness below 99%. The T5 summary lacks the event timing needed to attribute the deficit to source throughput, retransmission, server delivery, or the 40-second observation window. Future work could adapt the pace estimate across different client libraries and network paths, inspect per-run loss events, and evaluate a real lecture ASR input without changing the required WebSocket protocol.
+Results come from one machine with three runs per condition and a deterministic source; the hidden workload may combine conditions we did not test. Both loops read Linux TCP_INFO: on other platforms the network gate is off and a ping still in flight counts as a stall. Future work: a pause signal that survives congestion (for example, reading-progress reports from the client), pinging less often once a client has proven fast, and a real lecture speech recognizer behind the same protocol.
 
 ## References / appendix (outside the 4–5 page main text)
 

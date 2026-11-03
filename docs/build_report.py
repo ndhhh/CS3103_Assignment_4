@@ -181,19 +181,19 @@ def build(preview: bool):
               bullet("Per-client pending work is capped; a client that falls too far behind is closed so it can resume through bounded history rather than growing an unlimited queue."),
               para("Trade-off", "Subsection"),
               para("Coalescing lowers provisional update coverage during overload but protects final-caption delivery and freshness. The control loops should return to full-update delivery once lag clears. The browser demo separately verifies revision replacement, local recall, reconnect, and late join."),
-              para("The six deterministic server correctness checks passed on the Ubuntu VM used for the controlled slow-client study; the public and hidden performance workloads probe additional conditions.", "Note"),
+              para("The six server correctness checks (<b>bash tests/run_checks.sh</b>) pass on the machine used for every reported run.", "Note"),
               PageBreak()]
 
     # Page 3: public test methodology and tables.
     story += [para("4  Public experimental method", "Section"),
-              para("The supplied harness starts a fresh server for each run and logs caption receipt by simulated clients. Tests run on Ubuntu with the source and clients in one VM; T5 applies Linux tc/netem to loopback. Each reported scenario has three independent runs and median metrics. Caption Age is client receive time minus source timestamp. Freshness uses the public 500 ms threshold."),
+              para("The supplied harness, unmodified, starts a fresh server for each run and logs caption receipt by simulated clients. All runs used native Ubuntu 26.04 (Linux 7.0, 16 cores) with server, source and clients on one machine; T5 applies Linux tc/netem to loopback. Each scenario has three independent runs and median metrics. Caption Age is client receive time minus source timestamp. Freshness uses the public 500 ms threshold."),
               para("Required public tests", "Subsection")]
     rows = [["Test", "Condition", "P50", "P95", "P99", "Fresh", "Finals", "Compl.", "Cover."]]
     for test in TESTS:
         item = public[test]
         rows.append([test, item["condition"], item["p50"], item["p95"], item["p99"], item["fresh"], item["fresh_finals"], item["complete"], item["coverage"]])
     story += [table(rows, [31, 119, 48, 48, 48, 50, 50, 54, 51]), Spacer(1, 9),
-              para("T1-T4 had 100% median final completeness, but minimum individual-run completeness was 95.45%, 97.96%, 100%, and 97.37%, respectively. T3's slow readers raised P99 to 3.57 s; T4 recovery P95 was 15.1 ms. All reported T1-T5 runs had zero connection errors, duplicate captions, and stale captions.", "Note"),
+              para("Latencies in ms. Every run reached 100% final completeness, with no connection-error, duplicate or stale events. T3: normal clients stayed 100% fresh; slow readers had P50 181 ms and P95 7.5 s, which raises the overall P99. T4: recovery P95 was 3.4 ms.", "Note"),
               para("T5 network profiles", "Subsection")]
     profiles = public.get("T5_profiles", {})
     if not profiles and not preview:
@@ -204,24 +204,38 @@ def build(preview: bool):
         profile_rows.append([item.get("profile", "pending"), item["p50"], item["p95"], item["p99"],
                              item["fresh"], item["fresh_finals"], item["complete"], item["coverage"]])
     story += [table(profile_rows, [151, 49, 49, 49, 50, 50, 51, 50]), Spacer(1, 8),
-              para("Profiles used Linux tc/netem on loopback: 100 ± 20 ms delay, 120 ± 30 ms delay with 3% IP packet loss, and 3% loss alone. Each used 100 clients, a 40-second window, and three completed runs. Minimum per-run completeness was 100%, 97.82%, and 83.67%. The combined profile's P95 rose to 818 ms; the loss-only profile's 85.71% median completeness is a material shortfall despite its 64 ms P95 among observed captions. TCP retransmissions can increase tail latency; these summaries alone cannot establish why expected finals were absent before the cutoff.", "Note"),
+              para("Public network profiles on loopback, 100 clients, 40-second window, three runs each; every run reached 100% completeness. Delay shifts the whole distribution by about one round trip. Loss only hurts the tail: a lost segment is resent after TCP's 200 ms minimum retransmission timeout and every caption behind it waits (head-of-line blocking), so P95/P99 sit near that timeout.", "Note"),
               PageBreak()]
 
-    # Page 4: controlled comparison and interpretation.
-    story += [para("5  Controlled slow-reader comparison", "Section"),
-              para("A separate A/B study used 100 clients, 30% slow readers sleeping 500 ms after each message, exactly 76 source segments, and a 100-second client window. Three independent runs were made with the final lag-probe design and with <b>LIVERECALL_BACKPRESSURE=0</b>. The fixed segment count and longer window followed a 60-second sweep whose role breakdown exposed the cutoff confound."),
+    # Page 4: before/after comparison, failures and trade-offs.
+    story += [para("5  Before/after comparison", "Section"),
+              para("Before: the team's earlier queue-based server (PR 8), which reacts only when its own outbox backs up. After: the final design. Same machine and harness, three runs each."),
               table([
-                  ["Lag probes", "Overall P95", "Slow P95", "Fresh finals", "Final completeness", "Connection errors"],
-                  ["Enabled", "1,908 ms", "8,321 ms", "88.95%", "100 / 100 / 100%", "0 / 0 / 0"],
-                  ["Disabled", "35,563 ms", "42,356 ms", "70.39%", "92.5 / 100 / 100%", "7 / 30 / 30"],
-              ], [76, 75, 75, 79, 104, 90]),
-              Spacer(1, 11),
-              para("With probes enabled, median slow-client P95 was about 34 seconds lower and the fresh-final ratio was 18.56 percentage points higher. Normal-client P95 stayed below 30 ms in both configurations. Normal update coverage was 83.68% with probes and 92.73% without, consistent with replacing obsolete provisional revisions during overload. No duplicate or stale captions were recorded in these runs."),
-              para("6  Limitations and future work", "Section"),
-              para("The A/B result is one controlled workload on one VM with three repetitions; hidden tests may combine larger populations, burstier revisions, constrained bandwidth, and impairment removal. The initial 60-second sweep shows why observation-window timing must be inspected before interpreting missing finals. T5 packet loss exposed a completeness shortfall; per-run source and delivery timestamps are needed to separate source timing, retransmission delay, and server behavior."),
-              para("Future work could adapt read-rate estimation to other WebSocket client libraries and network paths, measure convergence after a bottleneck clears, and integrate a real lecture speech recognizer while preserving the same protocol and mandatory lightweight server path."),
+                  ["Scenario", "Compl. before", "Compl. after", "Metric", "Before", "After"],
+                  ["T3, 10% slow readers", "95.13%", "100.00%", "Slow-reader P50", "14.7 s", "181 ms"],
+                  ["30% slow readers", "85.39%", "100.00%", "Slow-reader P50", "14.7 s", "204 ms"],
+                  ["Slow readers, 300 clients, 2 Mbit/s", "95.00%", "100.00%", "Slow-reader P50", "14.6 s", "482 ms"],
+                  ["700 clients, 2 Mbit/s", "89.51%", "99.99%", "P95", "7.0 s", "2.0 s"],
+                  ["300 clients, 2 Mbit/s", "100%", "100%", "P50", "71 ms", "370 ms"],
+              ], [150, 62, 62, 85, 70, 70]),
+              Spacer(1, 9),
+              para("A slow reader's websockets library and kernel buffers absorb thousands of ~42-byte messages before the earlier server's outbox backs up, so its slow readers ended about 15 s behind and missed finals. The final design detects the pause at the library through ping/pong and paces the reader. The last row is a regression, explained below."),
+              para("6  Failures and trade-offs", "Section"),
+              para("What did not work (each measured, then dropped)", "Subsection"),
+              bullet("<b>Receive-window signal.</b> A slow reader's advertised TCP window stayed at 65,536 B with about 70 unread messages (128 KB buffers, ~42-byte messages), so TCP cannot reveal a slow reader. Hence the ping/pong loop."),
+              bullet("<b>TCP_NOTSENT_LOWAT.</b> Keeping unsent data in the outbox, where it can be replaced, gave nothing on a 2 Mbit/s bottleneck: the backlog was already in flight, not unsent."),
+              bullet("<b>One ping per 8 messages.</b> The pause point was known only to within 8 messages, so the server overestimated what was still queued after a stall (12 vs about 8). Readers taking 2 s per message idled about 10 s and missed the last final (99.87%). A ping on every 4th message, with the stall timed from the middle of the uncertainty interval, fixed this (100%; T3 slow-reader P50 from 222 to 181 ms)."),
+              bullet("<b>Thresholds from TCP's retransmission timeout and the caption stream's rate.</b> On a congested link a late pong includes network delay, so the reading rate implied by a stall is wrong: 909 fast clients were paced at 500 clients, and worst-run completeness fell to 94.3% at 700 clients. Reverted."),
+              para("Trade-offs we kept", "Subsection"),
+              bullet("<b>Slow readers</b> get fewer provisionals but current text: T3 coverage 94.4% (queue-only server 95.2%), slow-reader P50 181 ms (14.7 s), completeness 100% (95.13%)."),
+              bullet("<b>Under overload</b>, provisionals wait in the outbox and are replaced while finals go out: coverage 61% vs 99% at 500 clients on 2 Mbit/s, but completeness 99.99% vs 89.5% at 700 clients."),
+              bullet("<b>Probe precision costs bandwidth.</b> Each ping adds a pong and its ACK; at 300 clients on 2 Mbit/s P50 is 370 ms vs 71 ms."),
+              bullet("<b>A slow reader's first 15-20 s are stale</b> (8% fresh, then about 100%), because its library buffers 16 messages before any signal reaches the server. Shortening this would mean throttling every new client, which the coverage check penalizes."),
+              bullet("<b>Lost pongs under heavy overload</b> still cause false holds (518 fast-client pacing decisions across our network runs)."),
+              para("7  Limitations and future work", "Section"),
+              para("Results come from one machine with three runs per condition and a deterministic source; the hidden workload may combine conditions we did not test. Both loops read Linux TCP_INFO: on other platforms the network gate is off and a ping still in flight counts as a stall. Future work: a pause signal that survives congestion (for example, reading-progress reports from the client), pinging less often once a client has proven fast, and a real lecture speech recognizer behind the same protocol."),
               Spacer(1, 8),
-              para("Sources: CS3103 Assignment 4 LiveRecall brief (17 Oct 2026); supplied harness and code; controlled study in docs/slow_client_evaluation.md.", "Note")]
+              para("Sources: CS3103 Assignment 4 LiveRecall brief (17 Oct 2026); supplied harness and code; experiments/ and tests/ in this repository; earlier controlled slow-client study in docs/slow_client_evaluation.md.", "Note")]
 
     doc.build(story, onFirstPage=lambda c, d: footer(c, d, preview), onLaterPages=lambda c, d: footer(c, d, preview))
     print(output)
