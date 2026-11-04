@@ -5,7 +5,7 @@ Examples:
   python caption_source.py
   python caption_source.py --segments 40
   python caption_source.py --duration 120
-  python caption_source.py --transcript sample_transcript.txt --repeat 3
+  python caption_source.py --transcript /path/to/transcript.txt --repeat 3
 
 Each segment is completed before the next segment starts. Segment numbers are
 monotonically increasing from 1. Each segment has three revisions in this
