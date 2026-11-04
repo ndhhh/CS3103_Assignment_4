@@ -4,7 +4,7 @@ LiveRecall distributes a revision-based caption stream from the supplied determi
 
 ## Team
 
-Ng De Heng, Foo Juinn Kai, Jay Kim, and Ong Cheng Leong. Responsibilities and the contribution split are recorded in `CONTRIBUTIONS.md`.
+Ng De Heng, Foo Juinn Kai, Jae Hyeok Kim, and Ong Cheng Leong. Responsibilities and the contribution split are recorded in `CONTRIBUTIONS.md`.
 
 ## Ubuntu setup
 
