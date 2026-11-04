@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     Flowable,
     KeepTogether,
@@ -34,11 +37,37 @@ PUBLIC_KEYS = ("condition", "p50", "p95", "p99", "fresh", "fresh_finals", "compl
 TESTS = ("T1", "T2", "T3", "T4", "T5")
 PENDING = {key: "pending" for key in PUBLIC_KEYS}
 
-INK = colors.HexColor("#162127")
-MUTED = colors.HexColor("#53636a")
-TEAL = colors.HexColor("#007c78")
-PALE = colors.HexColor("#eaf5f3")
-LINE = colors.HexColor("#d8e1e3")
+INK = colors.black
+MARGIN = 23 * mm
+TEXT_WIDTH = A4[0] - 2 * MARGIN - 12  # Platypus frame has 6 pt padding on each side.
+
+
+def register_times(font_dir=None):
+    """Embed actual Times New Roman; never substitute a similar typeface."""
+    candidates = [
+        Path(font_dir) if font_dir else None,
+        Path(os.environ["TNR_FONT_DIR"]) if os.environ.get("TNR_FONT_DIR") else None,
+        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts",
+        Path("/Library/Fonts"),
+        Path("/System/Library/Fonts/Supplemental"),
+        Path("/usr/share/fonts/truetype/msttcorefonts"),
+        Path.home() / ".local/share/fonts",
+    ]
+    variants = (
+        ("TNR", ("times.ttf", "Times_New_Roman.ttf", "Times New Roman.ttf")),
+        ("TNR-Bold", ("timesbd.ttf", "Times_New_Roman_Bold.ttf", "Times New Roman Bold.ttf")),
+        ("TNR-Italic", ("timesi.ttf", "Times_New_Roman_Italic.ttf", "Times New Roman Italic.ttf")),
+        ("TNR-BoldItalic", ("timesbi.ttf", "Times_New_Roman_Bold_Italic.ttf", "Times New Roman Bold Italic.ttf")),
+    )
+    for font_name, names in variants:
+        font_path = next((folder / name for folder in candidates if folder
+                          for name in names if (folder / name).is_file()), None)
+        if font_path is None:
+            raise SystemExit("Times New Roman fonts are required. Use --font-dir or TNR_FONT_DIR.")
+        pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
+    pdfmetrics.registerFontFamily(
+        "TNR", normal="TNR", bold="TNR-Bold", italic="TNR-Italic", boldItalic="TNR-BoldItalic"
+    )
 
 
 class Architecture(Flowable):
@@ -51,44 +80,53 @@ class Architecture(Flowable):
 
     def draw(self):
         canvas = self.canv
+        gap = 20
+        box_width = (self.width - 2 * gap) / 3
         boxes = [
-            (0, "Caption source", "deterministic revisions"),
-            (160, "LiveRecall server", "state + bounded outboxes"),
-            (320, "Browser clients", "live + local recall"),
+            ("Caption source", "deterministic revisions"),
+            ("LiveRecall server", "state + bounded outboxes"),
+            ("Browser clients", "live + local recall"),
         ]
-        for x, title, subtitle in boxes:
-            canvas.setFillColor(PALE)
-            canvas.setStrokeColor(LINE)
-            canvas.roundRect(x, 18, 145, 62, 8, fill=1, stroke=1)
-            canvas.setFillColor(INK)
-            canvas.setFont("Helvetica-Bold", 10)
-            canvas.drawCentredString(x + 72.5, 53, title)
-            canvas.setFont("Helvetica", 7.5)
-            canvas.setFillColor(MUTED)
-            canvas.drawCentredString(x + 72.5, 38, subtitle)
-        canvas.setStrokeColor(TEAL)
-        canvas.setLineWidth(1.8)
-        for start in (146, 306):
-            canvas.line(start, 49, start + 12, 49)
-            p = canvas.beginPath()
-            p.moveTo(start + 12, 49)
-            p.lineTo(start + 7, 52)
-            p.moveTo(start + 12, 49)
-            p.lineTo(start + 7, 46)
-            canvas.drawPath(p)
+        canvas.setStrokeColor(INK)
+        canvas.setFillColor(INK)
+        canvas.setLineWidth(0.6)
+        for index, (title, subtitle) in enumerate(boxes):
+            x = index * (box_width + gap)
+            canvas.rect(x, 18, box_width, 56, fill=0, stroke=1)
+            canvas.setFont("TNR-Bold", 10)
+            canvas.drawCentredString(x + box_width / 2, 51, title)
+            canvas.setFont("TNR", 9)
+            canvas.drawCentredString(x + box_width / 2, 35, subtitle)
+            if index < 2:
+                start = x + box_width + 3
+                end = x + box_width + gap - 3
+                canvas.line(start, 46, end, 46)
+                canvas.line(end, 46, end - 4, 49)
+                canvas.line(end, 46, end - 4, 43)
 
 
 def styles():
     base = getSampleStyleSheet()
-    base.add(ParagraphStyle(name="CoverTitle", parent=base["Title"], fontName="Helvetica-Bold", fontSize=22, leading=26, textColor=INK, alignment=TA_LEFT, spaceAfter=8))
-    base.add(ParagraphStyle(name="Deck", parent=base["Normal"], fontSize=10, leading=14, textColor=MUTED, spaceAfter=11))
-    base.add(ParagraphStyle(name="Section", parent=base["Heading1"], fontName="Helvetica-Bold", fontSize=14, leading=17, textColor=INK, spaceBefore=8, spaceAfter=7))
-    base.add(ParagraphStyle(name="Subsection", parent=base["Heading2"], fontName="Helvetica-Bold", fontSize=10.5, leading=13, textColor=TEAL, spaceBefore=9, spaceAfter=4))
-    base.add(ParagraphStyle(name="Body", parent=base["Normal"], fontSize=9.1, leading=13.2, textColor=INK, spaceAfter=7))
-    base.add(ParagraphStyle(name="Note", parent=base["Normal"], fontSize=8, leading=11.2, textColor=MUTED, spaceAfter=6))
-    base.add(ParagraphStyle(name="TableHead", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=7, leading=9, textColor=colors.white, alignment=TA_CENTER))
-    base.add(ParagraphStyle(name="TableCell", parent=base["Normal"], fontSize=7, leading=9, textColor=INK, alignment=TA_CENTER))
-    base.add(ParagraphStyle(name="TableLeft", parent=base["TableCell"], alignment=TA_LEFT))
+    common = dict(fontName="TNR", textColor=INK)
+    specs = [
+        ("CoverCourse", dict(fontSize=14, leading=19, alignment=TA_CENTER, spaceAfter=10)),
+        ("CoverTitle", dict(fontName="TNR-Bold", fontSize=26, leading=31, alignment=TA_CENTER, spaceAfter=16)),
+        ("CoverSubtitle", dict(fontSize=15, leading=21, alignment=TA_CENTER)),
+        ("CoverAuthors", dict(fontSize=12, leading=21, alignment=TA_CENTER)),
+        ("CoverDate", dict(fontSize=12, leading=17, alignment=TA_CENTER)),
+        ("Section", dict(fontName="TNR-Bold", fontSize=13, leading=16, spaceBefore=14, spaceAfter=8, keepWithNext=True)),
+        ("Subsection", dict(fontName="TNR-Bold", fontSize=11, leading=14, spaceBefore=9, spaceAfter=5, keepWithNext=True)),
+        ("Body", dict(fontSize=11, leading=14.3, alignment=TA_JUSTIFY, spaceAfter=7, allowWidows=0, allowOrphans=0)),
+        ("BulletBody", dict(fontSize=11, leading=14.3, alignment=TA_JUSTIFY, leftIndent=12, firstLineIndent=-9, spaceAfter=6, allowWidows=0, allowOrphans=0)),
+        ("Note", dict(fontSize=9, leading=11.5, alignment=TA_LEFT, spaceAfter=7)),
+        ("Caption", dict(fontSize=10, leading=12, alignment=TA_LEFT, spaceBefore=6, spaceAfter=6, keepWithNext=True)),
+        ("TableHead", dict(fontName="TNR-Bold", fontSize=8.5, leading=10, alignment=TA_CENTER)),
+        ("TableCell", dict(fontSize=9, leading=11, alignment=TA_CENTER)),
+        ("TableLeft", dict(fontSize=9, leading=11, alignment=TA_LEFT)),
+        ("TableHeadLeft", dict(fontName="TNR-Bold", fontSize=8.5, leading=10, alignment=TA_LEFT)),
+    ]
+    for name, options in specs:
+        base.add(ParagraphStyle(name=name, parent=base["Normal"], **{**common, **options}))
     return base
 
 
@@ -97,24 +135,30 @@ def para(text: str, style: str = "Body"):
 
 
 def bullet(text: str):
-    return para("<font color='#007c78'><b>•</b></font>  " + text)
+    return para("•  " + text, "BulletBody")
 
 
 def table(rows, widths, first_header=True):
+    scale = TEXT_WIDTH / sum(widths)
+    widths = [width * scale for width in widths]
     prepared = []
+    left_columns = {0, 1} if len(rows[0]) == 9 else {0, 3} if len(rows[0]) == 6 else {0}
     for i, row in enumerate(rows):
-        style_name = "TableHead" if first_header and i == 0 else "TableCell"
-        prepared.append([para(str(value), "TableLeft" if j == 0 and i else style_name) for j, value in enumerate(row)])
+        prepared.append([
+            para(str(value), ("TableHeadLeft" if j in left_columns else "TableHead")
+                 if first_header and i == 0 else ("TableLeft" if j in left_columns else "TableCell"))
+            for j, value in enumerate(row)
+        ])
     obj = Table(prepared, colWidths=widths, hAlign="LEFT", repeatRows=1 if first_header else 0)
     obj.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), TEAL),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f8f8")]),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 7),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-        ("LINEBELOW", (0, -1), (-1, -1), 0.5, LINE),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LINEABOVE", (0, 0), (-1, 0), 0.8, INK),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.5, INK),
+        ("LINEBELOW", (0, -1), (-1, -1), 0.8, INK),
     ]))
     return obj
 
@@ -135,45 +179,54 @@ def load_public(preview: bool) -> dict:
 
 
 def footer(canvas, doc, preview: bool):
+    if doc.page == 1:
+        return
     canvas.saveState()
-    canvas.setStrokeColor(LINE)
-    canvas.line(48, 39, A4[0] - 48, 39)
-    canvas.setFont("Helvetica", 7.5)
-    canvas.setFillColor(MUTED)
-    canvas.drawString(48, 26, "CS3103 Assignment 4  |  LiveRecall")
+    canvas.setFont("TNR", 10)
+    canvas.setFillColor(INK)
+    canvas.drawCentredString(A4[0] / 2, 32, str(doc.page - 1))
     if preview:
-        canvas.setFillColor(colors.HexColor("#ae4b2f"))
-        canvas.drawCentredString(A4[0] / 2, 26, "DRAFT - T1-T5 DATA PENDING")
-    canvas.drawRightString(A4[0] - 48, 26, f"{doc.page}")
+        canvas.setFont("TNR", 8)
+        canvas.drawString(MARGIN, 32, "DRAFT - T1-T5 DATA PENDING")
     canvas.restoreState()
 
 
-def build(preview: bool):
+def build(preview: bool, output_path=None):
     public = load_public(preview)
-    output = ROOT / "docs" / "report_preview.pdf" if preview else ROOT / "report.pdf"
-    doc = SimpleDocTemplate(str(output), pagesize=A4, rightMargin=48, leftMargin=48, topMargin=50, bottomMargin=53,
+    output = Path(output_path) if output_path else (ROOT / "docs" / "report_preview.pdf" if preview else ROOT / "report.pdf")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    doc = SimpleDocTemplate(str(output), pagesize=A4, rightMargin=MARGIN, leftMargin=MARGIN, topMargin=MARGIN, bottomMargin=MARGIN,
                             title="LiveRecall: revision-aware delivery", author="CS3103 LiveRecall team")
-    width = A4[0] - 96
-    story = []
+    width = TEXT_WIDTH
+    story = [
+        Spacer(1, 70),
+        para("CS3103", "CoverCourse"),
+        para("Assignment 4 Report", "CoverCourse"),
+        Spacer(1, 42),
+        para("LiveRecall", "CoverTitle"),
+        para("Revision-aware live captions with<br/>bounded recovery and per-client delivery", "CoverSubtitle"),
+        Spacer(1, 72),
+        para("Ng De Heng<br/>Foo Juinn Kai<br/>Jay Kim<br/>Ong Cheng Leong", "CoverAuthors"),
+        Spacer(1, 65),
+        para("November 2026", "CoverDate"),
+        PageBreak(),
+    ]
 
-    # Page 1: system and user behavior.
-    story += [para("LiveRecall", "CoverTitle"),
-              para("Revision-aware live captions with bounded recovery and per-client delivery", "Deck"),
-              para("Ng De Heng  •  Foo Juinn Kai  •  Jay Kim  •  Ong Cheng Leong", "Note"),
-              para("1  System architecture", "Section"),
+    # Main text starts at page 1 after the unnumbered cover.
+    story += [para("1  System architecture", "Section"),
               para("The supplied deterministic source emits provisional revisions and a final caption for each segment. A WebSocket server validates and distributes that stream to many browser clients. The browser replaces revisions in place, retains recent finals, and provides a local 15/30/60-second recall view.")]
     story += [Architecture(width), Spacer(1, 5), para("Figure 1. Required data path. The server keeps bounded session history and separate per-client outboxes.", "Note")]
     story += [para("Protocol", "Subsection"),
               bullet("The source sends <b>SOURCE_HELLO</b>, then <b>CAPTION_UPDATE</b> objects with session, segment, revision, source timestamp, final flag, and text."),
               bullet("A student sends <b>CLIENT_HELLO</b> with the latest finalized segment/revision and a requested history window. The server replies with oldest-first <b>HISTORY</b>, then live updates."),
               bullet("The browser stores one current caption per segment, distinguishes provisional and final text, reconnects automatically, and requests only recent missed finals after a gap."),
-              para("The same submitted server and browser are used for the deterministic application demo and the measured tests; speech recognition is outside the mandatory path.", "Note"),
-              PageBreak()]
+              ]
 
-    # Page 2: correctness and overload design.
+    # Correctness follows the architecture; backpressure starts a new page.
     story += [para("2  Correctness and recovery", "Section"),
               para("The server accepts a revision only when it is newer than the stored revision and the segment has not already become final. This prevents stale updates from overwriting completed text. Final captions enter a bounded recent-history deque. On reconnect, the client sends its latest finalized cursor; the server returns only newer finals within the 60-second recovery limit. The browser deduplicates history against local segment state."),
               para("A late joiner starts with cursor zero and receives recent context before live updates. Snapshotting history and subscribing a client occur without an intervening await, avoiding a gap or duplicate around the handoff. The browser holds at least 60 seconds of recent finalized captions locally for ordinary recall."),
+              PageBreak(),
               para("3  Semantic backpressure", "Section"),
               para("Each client has a separate bounded outbox and sender task, so one slow receiver cannot block the source handler or normal readers. Under normal conditions the full revision stream is forwarded. When the network path falls behind, TCP acknowledgement feedback holds provisional revisions while finals proceed. Application-level ping/pong feedback detects a reader that has stopped consuming even when TCP has accepted bytes; that reader is held and then paced near its measured reading rate."),
               bullet("Unsent obsolete provisional revisions can be replaced with the latest state of their segment; finalized captions remain durable."),
@@ -181,37 +234,36 @@ def build(preview: bool):
               bullet("Per-client pending work is capped; a client that falls too far behind is closed so it can resume through bounded history rather than growing an unlimited queue."),
               para("Trade-off", "Subsection"),
               para("Coalescing lowers provisional update coverage during overload but protects final-caption delivery and freshness. The control loops should return to full-update delivery once lag clears. The browser demo separately verifies revision replacement, local recall, reconnect, and late join."),
-              para("The six server correctness checks (<b>bash tests/run_checks.sh</b>) pass on the machine used for every reported run.", "Note"),
-              PageBreak()]
+              ]
 
-    # Page 3: public test methodology and tables.
+    # Public test methodology and tables.
     story += [para("4  Public experimental method", "Section"),
               para("The supplied harness, unmodified, starts a fresh server for each run and logs caption receipt by simulated clients. All runs used native Ubuntu 26.04 (Linux 7.0, 16 cores) with server, source and clients on one machine; T5 applies Linux tc/netem to loopback. Each scenario has three independent runs and median metrics. Caption Age is client receive time minus source timestamp. Freshness uses the public 500 ms threshold."),
-              para("Required public tests", "Subsection")]
-    rows = [["Test", "Condition", "P50", "P95", "P99", "Fresh", "Finals", "Compl.", "Cover."]]
+              para("Table 1. Required public tests", "Caption")]
+    rows = [["Test", "Condition", "P50", "P95", "P99", "Fresh", "Fresh<br/>finals", "Compl.", "Cover."]]
     for test in TESTS:
         item = public[test]
         rows.append([test, item["condition"], item["p50"], item["p95"], item["p99"], item["fresh"], item["fresh_finals"], item["complete"], item["coverage"]])
     story += [table(rows, [31, 119, 48, 48, 48, 50, 50, 54, 51]), Spacer(1, 9),
-              para("Latencies in ms. Every run reached 100% final completeness, with no connection-error, duplicate or stale events. T3: normal clients stayed 100% fresh; slow readers had P50 181 ms and P95 7.5 s, which raises the overall P99. T4: recovery P95 was 3.4 ms.", "Note"),
-              para("T5 network profiles", "Subsection")]
+              para("Latencies in ms.", "Note"),
+              PageBreak(),
+              para("Table 2. T5 network profiles", "Caption")]
     profiles = public.get("T5_profiles", {})
     if not profiles and not preview:
         raise SystemExit("Missing T5_profiles in docs/report_data.json")
-    profile_rows = [["Profile", "P50", "P95", "P99", "Fresh", "Finals", "Compl.", "Cover."]]
+    profile_rows = [["Profile", "P50", "P95", "P99", "Fresh", "Fresh<br/>finals", "Compl.", "Cover."]]
     for key in ("delay_100ms", "delay_loss", "loss_3pct"):
         item = profiles.get(key, PENDING)
         profile_rows.append([item.get("profile", "pending"), item["p50"], item["p95"], item["p99"],
                              item["fresh"], item["fresh_finals"], item["complete"], item["coverage"]])
-    story += [table(profile_rows, [151, 49, 49, 49, 50, 50, 51, 50]), Spacer(1, 8),
-              para("Public network profiles on loopback, 100 clients, 40-second window, three runs each; every run reached 100% completeness. Delay shifts the whole distribution by about one round trip. Loss only hurts the tail: a lost segment is resent after TCP's 200 ms minimum retransmission timeout and every caption behind it waits (head-of-line blocking), so P95/P99 sit near that timeout.", "Note"),
-              PageBreak()]
+    story += [table(profile_rows, [151, 49, 49, 49, 50, 50, 51, 50]), Spacer(1, 8)]
 
-    # Page 4: before/after comparison, failures and trade-offs.
+    # Comparison follows network results; failures start the final body page.
     story += [para("5  Before/after comparison", "Section"),
               para("Before: the team's earlier queue-based server (PR 8), which reacts only when its own outbox backs up. After: the final design. Same machine and harness, three runs each."),
+              para("Table 3. Before/after comparison", "Caption"),
               table([
-                  ["Scenario", "Compl. before", "Compl. after", "Metric", "Before", "After"],
+                  ["Scenario", "Compl.<br/>before", "Compl.<br/>after", "Metric", "Before", "After"],
                   ["T3, 10% slow readers", "95.13%", "100.00%", "Slow-reader P50", "14.7 s", "181 ms"],
                   ["30% slow readers", "85.39%", "100.00%", "Slow-reader P50", "14.7 s", "204 ms"],
                   ["Slow readers, 300 clients, 2 Mbit/s", "95.00%", "100.00%", "Slow-reader P50", "14.6 s", "482 ms"],
@@ -220,6 +272,7 @@ def build(preview: bool):
               ], [150, 62, 62, 85, 70, 70]),
               Spacer(1, 9),
               para("A slow reader's websockets library and kernel buffers absorb thousands of ~42-byte messages before the earlier server's outbox backs up, so its slow readers ended about 15 s behind and missed finals. The final design detects the pause at the library through ping/pong and paces the reader. The last row is a regression, explained below."),
+              PageBreak(),
               para("6  Failures and trade-offs", "Section"),
               para("What did not work (each measured, then dropped)", "Subsection"),
               bullet("<b>Receive-window signal.</b> A slow reader's advertised TCP window stayed at 65,536 B with about 70 unread messages (128 KB buffers, ~42-byte messages), so TCP cannot reveal a slow reader. Hence the ping/pong loop."),
@@ -233,9 +286,11 @@ def build(preview: bool):
               bullet("<b>A slow reader's first 15-20 s are stale</b> (8% fresh, then about 100%), because its library buffers 16 messages before any signal reaches the server. Shortening this would mean throttling every new client, which the coverage check penalizes."),
               bullet("<b>Lost pongs under heavy overload</b> still cause false holds (518 fast-client pacing decisions across our network runs)."),
               para("7  Limitations and future work", "Section"),
-              para("Results come from one machine with three runs per condition and a deterministic source; the hidden workload may combine conditions we did not test. Both loops read Linux TCP_INFO: on other platforms the network gate is off and a ping still in flight counts as a stall. Future work: a pause signal that survives congestion (for example, reading-progress reports from the client), pinging less often once a client has proven fast, and a real lecture speech recognizer behind the same protocol."),
-              Spacer(1, 8),
-              para("Sources: CS3103 Assignment 4 LiveRecall brief (17 Oct 2026); supplied harness and code; experiments/ and tests/ in this repository; earlier controlled slow-client study in docs/slow_client_evaluation.md.", "Note")]
+              bullet("<b>Experimental scope.</b> Results come from one machine with three runs per condition and a deterministic source. The hidden workload may combine conditions we did not test."),
+              bullet("<b>Platform dependence.</b> Both control loops read Linux TCP_INFO. On other platforms, the network gate is off and a ping still in flight counts as a stall."),
+              bullet("<b>Congestion-resilient feedback.</b> Future work could use client reading-progress reports as a pause signal that remains reliable under congestion."),
+              bullet("<b>Lower probing overhead.</b> Ping less often once a client has proven fast."),
+              bullet("<b>Speech-recognition integration.</b> Connect a real lecture speech recognizer through the same protocol.")]
 
     doc.build(story, onFirstPage=lambda c, d: footer(c, d, preview), onLaterPages=lambda c, d: footer(c, d, preview))
     print(output)
@@ -244,6 +299,9 @@ def build(preview: bool):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preview", action="store_true", help="allow missing T1-T5 data and watermark the PDF")
+    parser.add_argument("--font-dir", help="directory containing the four Times New Roman TTF files")
+    parser.add_argument("--output", help="output PDF path (default: report.pdf in the source root)")
     args = parser.parse_args()
+    register_times(args.font_dir)
     STYLES = styles()
-    build(args.preview)
+    build(args.preview, args.output)
