@@ -1,6 +1,4 @@
-# AI and coding-assistant usage — team review required
-
-**Every team member must disclose their actual tools and check these examples before submission.**
+# AI and coding-assistant usage
 
 ## Tools and purposes
 
@@ -9,8 +7,6 @@
 - ChatGPT Luna-6 assisted Ng De Heng with code quality and application logic checks during the set up of client and server states, as well as caption history handling on new client connections and reconnections. 
 
 - Claude Code (Anthropic) assisted Jay Kim with implementing and refactoring the server's delivery path (per-client outboxes and the two control loops), writing the experiment runners and correctness checks in `experiments/` and `tests/`, running and summarizing the public, impairment and robustness experiments, and Linux TCP details (TCP_INFO, TCP_CORK). Each change was adopted only if it beat the previous version on the same tests.
-
-- The team must add any other AI or coding assistants used by any member, including what each was used for.
 
 ## A useful suggestion and verification
 
